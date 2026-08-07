@@ -58,7 +58,23 @@ uv run pytest                  # 6 flow tests incl. JWKS/product-verifier compat
 
 In dev a 2048-bit RSA keypair is generated at `PRIVATE_KEY_PATH` and tables are
 created on startup. In production inject `PRIVATE_KEY_PEM` from a secret manager
-and run schema via migrations (see below).
+and provision the schema with migrations (below).
+
+## Migrations (Alembic)
+
+`ENVIRONMENT=production` skips the startup `create_all`; the schema is owned by
+Alembic. The connection URL comes from `DATABASE_URL` (via app settings), so no
+credentials live in `alembic.ini`.
+
+```bash
+uv run alembic upgrade head           # apply migrations
+uv run alembic revision --autogenerate -m "describe change"   # after editing models.py
+uv run alembic check                  # CI guard: fails if models drift from migrations
+uv run alembic downgrade -1           # roll back one
+```
+
+The initial revision (`migrations/versions/*_initial_schema.py`) creates all five
+tables; `models.py` remains the source of truth that autogenerate diffs against.
 
 ## Connecting the ATS backend
 
@@ -79,8 +95,8 @@ VMS onboards the same way: point at this `ISSUER`/JWKS with its own `aud`.
 
 ## Production notes / follow-ups
 
-- **Migrations**: dev uses `create_all`. Add Alembic before production (the schema
-  in `models.py` is the source of truth).
+- **Migrations**: Alembic is wired (`alembic upgrade head`); dev still uses
+  `create_all` for convenience. `alembic check` guards against model drift in CI.
 - **Google**: install the `google` extra and set `GOOGLE_*`; the callback uses a
   stateless CSRF nonce today — add a persistent `state` store to harden.
 - **Signer**: `Signer` is the KMS seam; `LocalRSASigner` is the starting point.
