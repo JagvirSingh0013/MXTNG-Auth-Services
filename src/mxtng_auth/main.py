@@ -16,6 +16,11 @@ from mxtng_auth.signer import get_signer
 
 logger = logging.getLogger(__name__)
 
+# Keep the production ATS web application reachable even if an older deployment
+# omits it from CORS_ORIGINS. Additional product origins remain configurable via
+# the environment variable.
+FALLBACK_CORS_ORIGINS = ("https://ats-iota-five.vercel.app",)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,10 +35,11 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="MXTNG Auth Service", version="0.1.0", lifespan=lifespan)
+    cors_origins = list(dict.fromkeys((*settings.CORS_ORIGINS, *FALLBACK_CORS_ORIGINS)))
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
