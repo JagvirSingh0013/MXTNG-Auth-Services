@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: auth
+      POSTGRES_DB: mxtng_auth
+    ports:
+      - "5433:5432"
+    volumes:
+      - auth_pgdata:/var/lib/postgresql/data
+
+  auth:
+    build: .
+    ports:
+      - "8100:8100"
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+asyncpg://auth:auth@db:5432/mxtng_auth
+      ISSUER: http://localhost:8100
+      DEFAULT_AUDIENCE: ats
+      REFRESH_COOKIE_SECURE: "false"
+    depends_on:
+      - db
+
+volumes:
+  auth_pgdata:

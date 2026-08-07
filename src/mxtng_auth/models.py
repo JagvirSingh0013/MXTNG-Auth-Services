@@ -1,0 +1,127 @@
+"""Auth domain tables. Identity only — no product concepts (ADR-0005)."""
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from mxtng_auth.db import Base
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Credential(Base):
+    """A human's identity: the global Auth User Id plus login means (password/Google).
+
+    `auth_user_id` is the canonical, product-neutral UUID and the `sub` of every
+    issued token. A Credential is NOT a product account (ADR-0007).
+    """
+
+    __tablename__ = "credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    auth_user_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=_uuid, nullable=False
+    )
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    google_sub: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
+    )
+
+    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+        back_populates="credential", cascade="all, delete-orphan"
+    )
+
+
+class RefreshToken(Base):
+    """One rotating, single-use refresh token. Reuse of a rotated/revoked token is
+    treated as theft and revokes the whole `family_id` (ADR-0006)."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("credentials.id"), index=True, nullable=False
+    )
+    family_id: Mapped[str] = mapped_column(String(36), index=True, default=_uuid, nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    audience: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set when this token has been rotated (consumed) into a successor.
+    rotated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+    credential: Mapped["Credential"] = relationship(back_populates="refresh_tokens")
+
+
+class PasswordResetToken(Base):
+    """Single-use, short-TTL password reset token (hash stored, never the raw)."""
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("credentials.id"), index=True, nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class OAuthExchangeCode(Base):
+    """Short-TTL, single-use handoff code minted after a Google callback so the
+    browser can trade it (over POST) for tokens instead of leaking them in a URL."""
+
+    __tablename__ = "oauth_exchange_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("credentials.id"), index=True, nullable=False
+    )
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    audience: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class AuthAuditLog(Base):
+    """Append-only record of security-relevant events (login, signup, reset, …)."""
+
+    __tablename__ = "auth_audit_log"
+    __table_args__ = (UniqueConstraint("id", name="uq_auth_audit_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    credential_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    event: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
