@@ -51,13 +51,6 @@ class Settings(BaseSettings):
     # --- Admin (service-to-service) ----------------------------------------
     ADMIN_API_KEY: str = "change-me-admin-key"
 
-    # --- ATS-Backend (service-to-service role lookup) -----------------------
-    # Used at new-session login to check whether a credential is a recruiter,
-    # so single-session enforcement can be role-scoped even though this
-    # service is otherwise role-agnostic (ADR-0005).
-    ATS_BACKEND_URL: str = "http://localhost:8000"
-    INTERNAL_SERVICE_API_KEY: str = "change-me-internal-key"
-
     # --- CORS ---------------------------------------------------------------
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 

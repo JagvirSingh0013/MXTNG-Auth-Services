@@ -5,14 +5,10 @@ that is each product's job (ADR-0005/0007).
 """
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-logger = logging.getLogger(__name__)
 
 from mxtng_auth import events
 from mxtng_auth.models import (
@@ -68,14 +64,6 @@ class AccountDisabled(AuthError):
 class InvalidRefresh(AuthError):
     status_code = 401
     code = "invalid_refresh"
-
-
-class SessionAlreadyActive(AuthError):
-    """Recruiter already has a live session elsewhere; this login is refused
-    until that session ends (single-session-recruiter feature)."""
-
-    status_code = 409
-    code = "session_already_active"
 
 
 class InvalidResetToken(AuthError):
@@ -203,50 +191,6 @@ async def authenticate(
     return credential
 
 
-async def _is_recruiter(auth_user_id: str) -> bool:
-    """Best-effort role lookup against ATS-Backend. This service is deliberately
-    role-agnostic (ADR-0005), so it asks the product for the one fact it needs
-    to scope single-session enforcement to recruiters. Fails open (False) on
-    any error/timeout/unknown-user: a network hiccup or not-yet-provisioned
-    user must never lock a legitimate login out."""
-    url = f"{settings.ATS_BACKEND_URL}/api/v1/internal/users/{auth_user_id}/role"
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(
-                url, headers={"X-Internal-Service-Key": settings.INTERNAL_SERVICE_API_KEY}
-            )
-    except httpx.HTTPError as exc:
-        logger.warning("Recruiter role lookup failed (fail-open): %s -> %s", url, exc)
-        return False
-
-    if resp.status_code == 200:
-        return resp.json().get("role") == "user"
-
-    if resp.status_code != 404:
-        # 404 = not yet provisioned in ATS-Backend, an expected case on first
-        # login. Anything else (403 key mismatch, 5xx, wrong host entirely)
-        # is a deployment/config problem masquerading as fail-open.
-        logger.warning(
-            "Recruiter role lookup returned unexpected status (fail-open): %s -> %s",
-            url, resp.status_code,
-        )
-    return False
-
-
-async def _has_active_session(db: AsyncSession, *, credential_id: int) -> bool:
-    """A live refresh-token family exists: not revoked, not yet rotated into a
-    successor, and not expired."""
-    result = await db.execute(
-        select(RefreshToken.id).where(
-            RefreshToken.credential_id == credential_id,
-            RefreshToken.revoked.is_(False),
-            RefreshToken.rotated.is_(False),
-            RefreshToken.expires_at > _now(),
-        )
-    )
-    return result.first() is not None
-
-
 # --- Refresh-token issuance & rotation --------------------------------------
 async def issue_tokens(
     db: AsyncSession, *, credential: Credential, audience: str, family_id: str | None = None
@@ -255,17 +199,8 @@ async def issue_tokens(
     continuing an existing one during rotation.
 
     A `family_id`-less call means a brand-new session (fresh login, not a
-    refresh). For recruiters, that's the single-session enforcement point: if
-    another session is already live, this login is refused outright — it only
-    succeeds once the other session ends (single-session-recruiter feature)."""
-    if family_id is None and await _is_recruiter(credential.auth_user_id):
-        if await _has_active_session(db, credential_id=credential.id):
-            await _audit(db, "login_blocked_session_active", credential_id=credential.id)
-            await db.commit()
-            raise SessionAlreadyActive(
-                "You're already logged in on another device. Please log out there first."
-            )
-
+    refresh). Concurrent sessions are allowed: a user may be logged in on as
+    many devices as they like, each with its own independent token family."""
     audience = resolve_audience(audience)
     access_token, expires_in = mint_access_token(
         auth_user_id=credential.auth_user_id, email=credential.email, audience=audience
