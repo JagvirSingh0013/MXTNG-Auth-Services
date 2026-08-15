@@ -5,11 +5,14 @@ that is each product's job (ADR-0005/0007).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from mxtng_auth import events
 from mxtng_auth.models import (
@@ -206,16 +209,27 @@ async def _is_recruiter(auth_user_id: str) -> bool:
     to scope single-session enforcement to recruiters. Fails open (False) on
     any error/timeout/unknown-user: a network hiccup or not-yet-provisioned
     user must never lock a legitimate login out."""
+    url = f"{settings.ATS_BACKEND_URL}/api/v1/internal/users/{auth_user_id}/role"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
-                f"{settings.ATS_BACKEND_URL}/api/v1/internal/users/{auth_user_id}/role",
-                headers={"X-Internal-Service-Key": settings.INTERNAL_SERVICE_API_KEY},
+                url, headers={"X-Internal-Service-Key": settings.INTERNAL_SERVICE_API_KEY}
             )
-        if resp.status_code == 200:
-            return resp.json().get("role") == "user"
-    except httpx.HTTPError:
-        pass
+    except httpx.HTTPError as exc:
+        logger.warning("Recruiter role lookup failed (fail-open): %s -> %s", url, exc)
+        return False
+
+    if resp.status_code == 200:
+        return resp.json().get("role") == "user"
+
+    if resp.status_code != 404:
+        # 404 = not yet provisioned in ATS-Backend, an expected case on first
+        # login. Anything else (403 key mismatch, 5xx, wrong host entirely)
+        # is a deployment/config problem masquerading as fail-open.
+        logger.warning(
+            "Recruiter role lookup returned unexpected status (fail-open): %s -> %s",
+            url, resp.status_code,
+        )
     return False
 
 
