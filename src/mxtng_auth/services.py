@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +65,14 @@ class AccountDisabled(AuthError):
 class InvalidRefresh(AuthError):
     status_code = 401
     code = "invalid_refresh"
+
+
+class SessionAlreadyActive(AuthError):
+    """Recruiter already has a live session elsewhere; this login is refused
+    until that session ends (single-session-recruiter feature)."""
+
+    status_code = 409
+    code = "session_already_active"
 
 
 class InvalidResetToken(AuthError):
@@ -191,12 +200,58 @@ async def authenticate(
     return credential
 
 
+async def _is_recruiter(auth_user_id: str) -> bool:
+    """Best-effort role lookup against ATS-Backend. This service is deliberately
+    role-agnostic (ADR-0005), so it asks the product for the one fact it needs
+    to scope single-session enforcement to recruiters. Fails open (False) on
+    any error/timeout/unknown-user: a network hiccup or not-yet-provisioned
+    user must never lock a legitimate login out."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                f"{settings.ATS_BACKEND_URL}/api/v1/internal/users/{auth_user_id}/role",
+                headers={"X-Internal-Service-Key": settings.INTERNAL_SERVICE_API_KEY},
+            )
+        if resp.status_code == 200:
+            return resp.json().get("role") == "user"
+    except httpx.HTTPError:
+        pass
+    return False
+
+
+async def _has_active_session(db: AsyncSession, *, credential_id: int) -> bool:
+    """A live refresh-token family exists: not revoked, not yet rotated into a
+    successor, and not expired."""
+    result = await db.execute(
+        select(RefreshToken.id).where(
+            RefreshToken.credential_id == credential_id,
+            RefreshToken.revoked.is_(False),
+            RefreshToken.rotated.is_(False),
+            RefreshToken.expires_at > _now(),
+        )
+    )
+    return result.first() is not None
+
+
 # --- Refresh-token issuance & rotation --------------------------------------
 async def issue_tokens(
     db: AsyncSession, *, credential: Credential, audience: str, family_id: str | None = None
 ) -> tuple[str, int, str]:
     """Return (access_token, expires_in, refresh_raw). Starts a new family unless
-    continuing an existing one during rotation."""
+    continuing an existing one during rotation.
+
+    A `family_id`-less call means a brand-new session (fresh login, not a
+    refresh). For recruiters, that's the single-session enforcement point: if
+    another session is already live, this login is refused outright — it only
+    succeeds once the other session ends (single-session-recruiter feature)."""
+    if family_id is None and await _is_recruiter(credential.auth_user_id):
+        if await _has_active_session(db, credential_id=credential.id):
+            await _audit(db, "login_blocked_session_active", credential_id=credential.id)
+            await db.commit()
+            raise SessionAlreadyActive(
+                "You're already logged in on another device. Please log out there first."
+            )
+
     audience = resolve_audience(audience)
     access_token, expires_in = mint_access_token(
         auth_user_id=credential.auth_user_id, email=credential.email, audience=audience
