@@ -11,11 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from mxtng_auth import services
 from mxtng_auth.db import get_db
 from mxtng_auth.schemas import (
+    ChallengeResendRequest,
+    ChallengeResponse,
+    ChallengeVerifyRequest,
     CredentialCreate,
     CredentialRead,
     EmailChange,
     GoogleAuthStart,
-    GoogleExchangeRequest,
     LoginRequest,
     MessageResponse,
     PasswordResetConfirm,
@@ -46,6 +48,22 @@ def _set_refresh_cookie(response: Response, raw: str) -> None:
         samesite="lax",
         path=settings.REFRESH_COOKIE_PATH,
         domain=settings.REFRESH_COOKIE_DOMAIN,
+    )
+
+
+def _email_hint(email: str) -> str:
+    """Enough for 'we sent a code to a…@example.com' without printing the address
+    back to whoever is holding the challenge."""
+    local, _, domain = email.partition("@")
+    masked = local[0] + "•" * max(len(local) - 1, 1) if local else "•"
+    return f"{masked}@{domain}" if domain else masked
+
+
+def _challenge_response(challenge, email: str) -> ChallengeResponse:
+    return ChallengeResponse(
+        challenge_id=challenge.challenge_id,
+        expires_in=settings.OTP_TTL_SECONDS,
+        email_hint=_email_hint(email),
     )
 
 
@@ -87,8 +105,12 @@ async def create_credential(
 
 
 # --- Login / refresh / logout ----------------------------------------------
-@v1.post("/login", response_model=TokenResponse)
+@v1.post("/login", response_model=TokenResponse, deprecated=True)
 async def login(payload: LoginRequest, request: Request, response: Response, db: DbDep) -> TokenResponse:
+    """Legacy single-step sign-in, kept alive only so products can migrate to the
+    challenge flow one at a time. `REQUIRE_OTP=true` closes it (ADR-0011)."""
+    if settings.REQUIRE_OTP:
+        raise services.OtpRequired("Single-step sign-in is retired. Use /v1/login/challenge.")
     credential = await services.authenticate(
         db, email=payload.email, password=payload.password, ip=_client_ip(request)
     )
@@ -97,6 +119,52 @@ async def login(payload: LoginRequest, request: Request, response: Response, db:
     )
     _set_refresh_cookie(response, refresh_raw)
     return TokenResponse(access_token=access_token, expires_in=expires_in)
+
+
+# --- Sign-in challenge (ADR-0011) -------------------------------------------
+@v1.post(
+    "/login/challenge",
+    response_model=ChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def login_challenge(
+    payload: LoginRequest, request: Request, db: DbDep
+) -> ChallengeResponse:
+    """Verify the password, then withhold tokens until the emailed code comes back."""
+    credential = await services.authenticate(
+        db, email=payload.email, password=payload.password, ip=_client_ip(request)
+    )
+    challenge = await services.start_challenge(
+        db, credential=credential, audience=payload.audience or "", ip=_client_ip(request)
+    )
+    return _challenge_response(challenge, credential.email)
+
+
+@v1.post("/login/verify", response_model=TokenResponse)
+async def login_verify(
+    payload: ChallengeVerifyRequest, request: Request, response: Response, db: DbDep
+) -> TokenResponse:
+    access_token, expires_in, refresh_raw = await services.verify_challenge(
+        db, challenge_id=payload.challenge_id, code=payload.code, ip=_client_ip(request)
+    )
+    _set_refresh_cookie(response, refresh_raw)
+    return TokenResponse(access_token=access_token, expires_in=expires_in)
+
+
+@v1.post(
+    "/login/resend",
+    response_model=ChallengeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def login_resend(
+    payload: ChallengeResendRequest, request: Request, db: DbDep
+) -> ChallengeResponse:
+    """Mint a replacement code. The previous one stops working immediately."""
+    challenge = await services.resend_challenge(
+        db, challenge_id=payload.challenge_id, ip=_client_ip(request)
+    )
+    credential = await services.get_credential(db, challenge.credential_id)
+    return _challenge_response(challenge, credential.email if credential else "")
 
 
 @v1.post("/token/refresh", response_model=TokenResponse)
@@ -178,24 +246,18 @@ async def google_callback(code: str, request: Request, db: DbDep, state: str | N
     credential = await services.upsert_google_credential(
         db, google_sub=google_sub, email=email, ip=_client_ip(request)
     )
-    handoff = await services.create_oauth_exchange_code(
-        db, credential=credential, audience=settings.DEFAULT_AUDIENCE
+    # Google proves the first factor; the Sign-in Code is still owed (ADR-0011).
+    # The challenge id doubles as the browser hand-off the old exchange code used
+    # to be — it is inert without the emailed code, so a redirect URL is safe.
+    challenge = await services.start_challenge(
+        db, credential=credential, audience=settings.DEFAULT_AUDIENCE, ip=_client_ip(request)
     )
     if settings.GOOGLE_POST_LOGIN_REDIRECT:
         sep = "&" if "?" in settings.GOOGLE_POST_LOGIN_REDIRECT else "?"
-        return RedirectResponse(f"{settings.GOOGLE_POST_LOGIN_REDIRECT}{sep}code={handoff}")
-    return {"code": handoff}
-
-
-@v1.post("/google/exchange", response_model=TokenResponse)
-async def google_exchange(
-    payload: GoogleExchangeRequest, request: Request, response: Response, db: DbDep
-) -> TokenResponse:
-    access_token, expires_in, refresh_raw = await services.redeem_oauth_exchange_code(
-        db, raw=payload.code, ip=_client_ip(request)
-    )
-    _set_refresh_cookie(response, refresh_raw)
-    return TokenResponse(access_token=access_token, expires_in=expires_in)
+        return RedirectResponse(
+            f"{settings.GOOGLE_POST_LOGIN_REDIRECT}{sep}challenge={challenge.challenge_id}"
+        )
+    return _challenge_response(challenge, credential.email)
 
 
 # --- Admin (service-to-service identity mutations) --------------------------

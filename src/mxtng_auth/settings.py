@@ -36,17 +36,51 @@ class Settings(BaseSettings):
     LOGIN_LOCKOUT_SECONDS: int = 15 * 60
     RESET_TOKEN_TTL_SECONDS: int = 30 * 60
 
+    # --- Sign-in challenge (emailed OTP, ADR-0011) --------------------------
+    # False keeps legacy `/v1/login` issuing tokens directly so products can
+    # migrate one at a time; flipping it to True closes that path for good.
+    REQUIRE_OTP: bool = False
+    OTP_CODE_LENGTH: int = 6
+    OTP_TTL_SECONDS: int = 5 * 60
+    # Per-challenge guesses. Deliberately equal to MAX_FAILED_LOGINS: a wrong code
+    # increments the same counter, so both ceilings are one policy, not two.
+    OTP_MAX_ATTEMPTS: int = 5
+    OTP_RESEND_COOLDOWN_SECONDS: int = 60
+    OTP_MAX_SENDS_PER_CHALLENGE: int = 3
+
     # --- Sign-in-with-Google (optional) ------------------------------------
     GOOGLE_CLIENT_ID: str | None = None
     GOOGLE_CLIENT_SECRET: str | None = None
     GOOGLE_REDIRECT_URI: str | None = None
-    # Where the callback sends the browser with its one-time ?code=; JSON in dev if unset.
+    # Where the callback sends the browser with its ?challenge=; JSON in dev if unset.
     GOOGLE_POST_LOGIN_REDIRECT: str | None = None
-    OAUTH_EXCHANGE_CODE_TTL_SECONDS: int = 120
 
     # --- IdentityEvent webhooks --------------------------------------------
     WEBHOOK_ENDPOINTS: list[str] = []
     WEBHOOK_SECRET: str = "change-me-webhook-secret"
+
+    # --- Outbound mail ------------------------------------------------------
+    # Primary path: the ATS platform-mail relay (ADR-0010's SMTP configuration).
+    # Auth renders the whole message and the relay is dumb transport, so the
+    # request is HMAC-signed and timestamped rather than bearing a bare key.
+    MAIL_RELAY_URL: str | None = None
+    MAIL_RELAY_SECRET: str = "change-me-mail-relay-secret"
+    MAIL_RELAY_TIMEOUT_SECONDS: float = 10.0
+
+    # Break-glass path: used only when the relay is unreachable or reports no
+    # active SMTP configuration. Without this a fresh environment cannot be
+    # bootstrapped — configuring mail requires a login that requires mail.
+    FALLBACK_SMTP_HOST: str | None = None
+    FALLBACK_SMTP_PORT: int = 587
+    FALLBACK_SMTP_USERNAME: str | None = None
+    FALLBACK_SMTP_PASSWORD: str | None = None
+    FALLBACK_SMTP_USE_TLS: bool = True
+    FALLBACK_SMTP_TIMEOUT_SECONDS: float = 10.0
+    MAIL_FROM_EMAIL: str = "no-reply@mxtng.local"
+    MAIL_FROM_NAME: str = "MXTNG"
+    # Product page that trades a reset token for a new password. Unset sends the
+    # bare token instead of a link.
+    PASSWORD_RESET_URL: str | None = None
 
     # --- Admin (service-to-service) ----------------------------------------
     ADMIN_API_KEY: str = "change-me-admin-key"
@@ -59,6 +93,10 @@ class Settings(BaseSettings):
         return bool(
             self.GOOGLE_CLIENT_ID and self.GOOGLE_CLIENT_SECRET and self.GOOGLE_REDIRECT_URI
         )
+
+    @property
+    def fallback_smtp_enabled(self) -> bool:
+        return bool(self.FALLBACK_SMTP_HOST)
 
 
 settings = Settings()

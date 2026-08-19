@@ -10,19 +10,22 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from mxtng_auth import events
+from mxtng_auth import events, mail
 from mxtng_auth.models import (
     AuthAuditLog,
     Credential,
-    OAuthExchangeCode,
     PasswordResetToken,
     RefreshToken,
+    SignInChallenge,
 )
 from mxtng_auth.security import (
     hash_opaque_token,
     hash_password,
+    hash_sign_in_code,
     new_opaque_token,
+    new_sign_in_code,
     verify_password,
+    verify_sign_in_code,
 )
 from mxtng_auth.settings import settings
 from mxtng_auth.tokens import mint_access_token, resolve_audience
@@ -71,6 +74,26 @@ class InvalidResetToken(AuthError):
     code = "invalid_reset_token"
 
 
+class InvalidChallenge(AuthError):
+    status_code = 401
+    code = "invalid_challenge"
+
+
+class ResendTooSoon(AuthError):
+    status_code = 429
+    code = "resend_too_soon"
+
+
+class MailDeliveryFailed(AuthError):
+    status_code = 502
+    code = "mail_delivery_failed"
+
+
+class OtpRequired(AuthError):
+    status_code = 403
+    code = "otp_required"
+
+
 # --- Helpers ----------------------------------------------------------------
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -106,6 +129,10 @@ async def _audit(
 async def _get_by_email(db: AsyncSession, email: str) -> Credential | None:
     result = await db.execute(select(Credential).where(Credential.email == email))
     return result.scalar_one_or_none()
+
+
+async def get_credential(db: AsyncSession, credential_id: int) -> Credential | None:
+    return await db.get(Credential, credential_id)
 
 
 async def get_by_auth_user_id(db: AsyncSession, auth_user_id: str) -> Credential | None:
@@ -189,6 +216,157 @@ async def authenticate(
     await _audit(db, "login_succeeded", credential_id=credential.id, email=email, ip=ip)
     await db.commit()
     return credential
+
+
+# --- Sign-in challenge (ADR-0011) -------------------------------------------
+async def _supersede_challenges(db: AsyncSession, *, credential_id: int) -> None:
+    """At most one challenge is live per credential, so a fresh sign-in always
+    invalidates whatever an earlier attempt left behind."""
+    result = await db.execute(
+        select(SignInChallenge).where(
+            SignInChallenge.credential_id == credential_id,
+            SignInChallenge.consumed.is_(False),
+        )
+    )
+    for challenge in result.scalars().all():
+        challenge.consumed = True
+
+
+async def _mail_sign_in_code(credential: Credential, code: str) -> None:
+    message = mail.render_sign_in_code(
+        code=code, ttl_seconds=settings.OTP_TTL_SECONDS, requested_at=_now()
+    )
+    await mail.send(
+        to_email=credential.email,
+        message=message,
+        purpose=mail.PURPOSE_SIGN_IN_CODE,
+        mode=mail.MODE_INLINE,
+    )
+
+
+async def start_challenge(
+    db: AsyncSession, *, credential: Credential, audience: str, ip: str | None = None
+) -> SignInChallenge:
+    """Withhold tokens behind an emailed Sign-in Code. The caller has already
+    proved the first factor (password, or a verified Google identity)."""
+    audience = resolve_audience(audience)
+    await _supersede_challenges(db, credential_id=credential.id)
+
+    code = new_sign_in_code(settings.OTP_CODE_LENGTH)
+    challenge = SignInChallenge(
+        credential_id=credential.id,
+        code_hash=hash_sign_in_code(code),
+        audience=audience,
+        expires_at=_now() + timedelta(seconds=settings.OTP_TTL_SECONDS),
+    )
+    db.add(challenge)
+    await db.commit()
+    await db.refresh(challenge)
+
+    try:
+        await _mail_sign_in_code(credential, code)
+    except mail.MailUndeliverable as exc:
+        # A challenge nobody can answer is worse than no challenge: retire it so a
+        # retry is not blocked by a dead row, and fail the sign-in visibly.
+        challenge.consumed = True
+        await _audit(db, "otp_send_failed", credential_id=credential.id,
+                     email=credential.email, ip=ip, detail=str(exc)[:400])
+        await db.commit()
+        raise MailDeliveryFailed("Could not send your sign-in code. Try again shortly.") from exc
+
+    await _audit(db, "otp_challenged", credential_id=credential.id, email=credential.email, ip=ip)
+    await db.commit()
+    return challenge
+
+
+async def _load_live_challenge(db: AsyncSession, challenge_id: str) -> SignInChallenge:
+    result = await db.execute(
+        select(SignInChallenge).where(SignInChallenge.challenge_id == challenge_id)
+    )
+    challenge = result.scalar_one_or_none()
+    if challenge is None or challenge.consumed or _aware(challenge.expires_at) < _now():
+        raise InvalidChallenge("Invalid or expired sign-in code")
+    return challenge
+
+
+async def resend_challenge(
+    db: AsyncSession, *, challenge_id: str, ip: str | None = None
+) -> SignInChallenge:
+    """Mint a fresh code and restart the window. The previous code stops working —
+    which is why the email carries the time it was requested."""
+    challenge = await _load_live_challenge(db, challenge_id)
+
+    since_last = (_now() - _aware(challenge.last_sent_at)).total_seconds()
+    if since_last < settings.OTP_RESEND_COOLDOWN_SECONDS:
+        raise ResendTooSoon("Wait a moment before requesting another code.")
+    if challenge.sends >= settings.OTP_MAX_SENDS_PER_CHALLENGE:
+        raise ResendTooSoon("Too many codes requested. Start signing in again.")
+
+    credential = await db.get(Credential, challenge.credential_id)
+    if credential is None or credential.disabled:
+        raise AccountDisabled("This account has been disabled")
+
+    code = new_sign_in_code(settings.OTP_CODE_LENGTH)
+    challenge.code_hash = hash_sign_in_code(code)
+    challenge.expires_at = _now() + timedelta(seconds=settings.OTP_TTL_SECONDS)
+    challenge.attempts = 0
+    challenge.sends += 1
+    challenge.last_sent_at = _now()
+    await db.commit()
+
+    try:
+        await _mail_sign_in_code(credential, code)
+    except mail.MailUndeliverable as exc:
+        await _audit(db, "otp_send_failed", credential_id=credential.id,
+                     email=credential.email, ip=ip, detail=str(exc)[:400])
+        await db.commit()
+        raise MailDeliveryFailed("Could not send your sign-in code. Try again shortly.") from exc
+
+    await _audit(db, "otp_resent", credential_id=credential.id, email=credential.email, ip=ip)
+    await db.commit()
+    return challenge
+
+
+async def verify_challenge(
+    db: AsyncSession, *, challenge_id: str, code: str, ip: str | None = None
+) -> tuple[str, int, str]:
+    """Trade a correct Sign-in Code for tokens. Wrong codes count against the same
+    lockout a wrong password does, so possession of the password buys a fixed
+    number of guesses in total rather than five per challenge, forever."""
+    challenge = await _load_live_challenge(db, challenge_id)
+
+    credential = await db.get(Credential, challenge.credential_id)
+    if credential is None:
+        raise InvalidChallenge("Invalid or expired sign-in code")
+    if credential.disabled:
+        raise AccountDisabled("This account has been disabled")
+
+    locked_until = _aware(credential.locked_until)
+    if locked_until and locked_until > _now():
+        raise AccountLocked("Too many failed attempts. Try again later.")
+
+    if not verify_sign_in_code(code, challenge.code_hash):
+        challenge.attempts += 1
+        credential.failed_attempts += 1
+        if (
+            credential.failed_attempts >= settings.MAX_FAILED_LOGINS
+            or challenge.attempts >= settings.OTP_MAX_ATTEMPTS
+        ):
+            challenge.consumed = True
+        if credential.failed_attempts >= settings.MAX_FAILED_LOGINS:
+            credential.locked_until = _now() + timedelta(seconds=settings.LOGIN_LOCKOUT_SECONDS)
+            credential.failed_attempts = 0
+        await _audit(db, "otp_failed", credential_id=credential.id,
+                     email=credential.email, ip=ip)
+        await db.commit()
+        raise InvalidChallenge("Invalid or expired sign-in code")
+
+    challenge.consumed = True
+    credential.failed_attempts = 0
+    credential.locked_until = None
+    await _audit(db, "otp_verified", credential_id=credential.id, email=credential.email, ip=ip)
+    await db.commit()
+    return await issue_tokens(db, credential=credential, audience=challenge.audience)
 
 
 # --- Refresh-token issuance & rotation --------------------------------------
@@ -303,8 +481,13 @@ async def revoke_all_for_credential(db: AsyncSession, *, credential: Credential)
 
 # --- Password reset ---------------------------------------------------------
 async def request_password_reset(db: AsyncSession, *, email: str, ip: str | None = None) -> str | None:
-    """Create a single-use reset token. Returns the raw token to the caller so the
-    transport (email) can deliver it; None if the email is unknown (no enumeration)."""
+    """Create a single-use reset token and email it. Returns the raw token for the
+    non-production convenience echo; None if the email is unknown (no enumeration).
+
+    Unlike a Sign-in Code this goes through the relay's durable outbox: a 30-minute
+    token comfortably tolerates a worker poll, and a queued reset is better than a
+    lost one.
+    """
     email = _normalize_email(email)
     credential = await _get_by_email(db, email)
     await _audit(db, "password_reset_requested", email=email, ip=ip,
@@ -321,6 +504,25 @@ async def request_password_reset(db: AsyncSession, *, email: str, ip: str | None
         )
     )
     await db.commit()
+
+    message = mail.render_password_reset(
+        token=raw,
+        ttl_seconds=settings.RESET_TOKEN_TTL_SECONDS,
+        reset_url=settings.PASSWORD_RESET_URL,
+    )
+    try:
+        await mail.send(
+            to_email=credential.email,
+            message=message,
+            purpose=mail.PURPOSE_PASSWORD_RESET,
+            mode=mail.MODE_QUEUED,
+        )
+    except mail.MailUndeliverable as exc:
+        # The token is already valid, so surface the failure in the audit log rather
+        # than telling an anonymous caller that this address exists but mail broke.
+        await _audit(db, "password_reset_send_failed", credential_id=credential.id,
+                     email=email, ip=ip, detail=str(exc)[:400])
+        await db.commit()
     return raw
 
 
@@ -373,42 +575,6 @@ async def upsert_google_credential(
     await db.commit()
     await db.refresh(credential)
     return credential
-
-
-async def create_oauth_exchange_code(
-    db: AsyncSession, *, credential: Credential, audience: str
-) -> str:
-    """Mint a one-time handoff code (raw returned; only its hash is stored)."""
-    audience = resolve_audience(audience)
-    raw = new_opaque_token()
-    db.add(
-        OAuthExchangeCode(
-            credential_id=credential.id,
-            code_hash=hash_opaque_token(raw),
-            audience=audience,
-            expires_at=_now() + timedelta(seconds=settings.OAUTH_EXCHANGE_CODE_TTL_SECONDS),
-        )
-    )
-    await db.commit()
-    return raw
-
-
-async def redeem_oauth_exchange_code(
-    db: AsyncSession, *, raw: str, ip: str | None = None
-) -> tuple[str, int, str]:
-    """Trade a valid handoff code for tokens. Single-use and short-TTL."""
-    result = await db.execute(
-        select(OAuthExchangeCode).where(OAuthExchangeCode.code_hash == hash_opaque_token(raw))
-    )
-    code = result.scalar_one_or_none()
-    if code is None or code.used or _aware(code.expires_at) < _now():
-        raise InvalidRefresh("Invalid or expired exchange code")
-    credential = await db.get(Credential, code.credential_id)
-    if credential is None or credential.disabled:
-        raise AccountDisabled("This account has been disabled")
-    code.used = True
-    await db.commit()
-    return await issue_tokens(db, credential=credential, audience=code.audience)
 
 
 # --- Admin identity mutations (emit IdentityEvents) -------------------------

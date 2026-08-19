@@ -95,20 +95,35 @@ class PasswordResetToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
 
-class OAuthExchangeCode(Base):
-    """Short-TTL, single-use handoff code minted after a Google callback so the
-    browser can trade it (over POST) for tokens instead of leaking them in a URL."""
+class SignInChallenge(Base):
+    """A pending second factor: the first factor passed, tokens are withheld until
+    the emailed Sign-in Code is presented (ADR-0011).
 
-    __tablename__ = "oauth_exchange_codes"
+    Also carries the Google hand-off — a challenge id is useless without the code
+    in the mailbox, so it can ride in a redirect URL where a token never could.
+    That is why `oauth_exchange_codes` no longer exists.
+    """
+
+    __tablename__ = "sign_in_challenges"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    challenge_id: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, default=_uuid, nullable=False
+    )
     credential_id: Mapped[int] = mapped_column(
         ForeignKey("credentials.id"), index=True, nullable=False
     )
-    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    # bcrypt over the code: a 6-digit secret is trivially reversible from a plain
+    # digest, so the cost factor is what makes a leaked table useless.
+    code_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     audience: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sends: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
 

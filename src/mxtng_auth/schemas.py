@@ -23,6 +23,24 @@ class LoginRequest(BaseModel):
     audience: str | None = None
 
 
+class ChallengeResponse(BaseModel):
+    """A sign-in that is not finished. The challenge id is safe in a URL: it is
+    worthless without the code that was emailed (ADR-0011)."""
+
+    challenge_id: str
+    expires_in: int
+    email_hint: str
+
+
+class ChallengeVerifyRequest(BaseModel):
+    challenge_id: str
+    code: str = Field(min_length=4, max_length=12)
+
+
+class ChallengeResendRequest(BaseModel):
+    challenge_id: str
+
+
 class TokenResponse(BaseModel):
     """Product-generic identity token. Products fetch their own domain data
     (workspace, agency, role) from their own `/users/me`, never from here."""
@@ -45,12 +63,6 @@ class PasswordResetConfirm(BaseModel):
 # --- Google -----------------------------------------------------------------
 class GoogleAuthStart(BaseModel):
     authorization_url: str
-
-
-class GoogleExchangeRequest(BaseModel):
-    code: str
-    state: str | None = None
-    audience: str | None = None
 
 
 # --- Admin identity mutations (service-to-service) --------------------------

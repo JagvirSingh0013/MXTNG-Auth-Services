@@ -32,20 +32,42 @@ performs authorization.
 | GET | `/health` | Liveness |
 | GET | `/.well-known/jwks.json` | Public keys for offline verification |
 | POST | `/v1/credentials` | Sign up (idempotent via `Idempotency-Key` header) |
-| POST | `/v1/login` | Password login → access token + refresh cookie |
+| POST | `/v1/login` | **Deprecated.** Legacy single-step login; 403 once `REQUIRE_OTP=true` |
+| POST | `/v1/login/challenge` | Password → 202 + Sign-in Challenge (code emailed) |
+| POST | `/v1/login/verify` | Challenge + code → access token + refresh cookie |
+| POST | `/v1/login/resend` | Mint a replacement code (invalidates the previous one) |
 | POST | `/v1/token/refresh` | Rotate refresh (cookie in → new access + cookie) |
 | POST | `/v1/logout` | Revoke this refresh family |
 | POST | `/v1/logout-all` | Revoke every refresh family for the user |
 | POST | `/v1/password-reset/request` | Begin reset (no user enumeration) |
 | POST | `/v1/password-reset/confirm` | Complete reset (revokes all sessions) |
 | GET | `/v1/google/start` | Sign-in-with-Google authorization URL |
-| GET | `/v1/google/callback` | Google redirect → one-time handoff code |
-| POST | `/v1/google/exchange` | Trade handoff code for tokens |
+| GET | `/v1/google/callback` | Google redirect → Sign-in Challenge (`?challenge=`) |
 | POST | `/v1/admin/credentials/{auth_user_id}/email` | Change email → `email.changed` event |
 | POST | `/v1/admin/credentials/{auth_user_id}/disable` | Disable → `account.disabled` event |
 
 Login/refresh/logout responses carry **identity only**. Products fetch their own
 domain data (workspace, agency, role) from their own `/users/me`, never from here.
+
+### Sign-in is two steps (ADR-0011)
+
+Every credential is challenged, on every audience — Google sign-in included. A correct
+password returns **202 and no tokens**; the session is created only by
+`/v1/login/verify`.
+
+```
+POST /v1/login/challenge  {email, password}   → 202 {challenge_id, expires_in, email_hint}
+                                                    (6-digit code emailed, 5 min, 5 tries)
+POST /v1/login/verify     {challenge_id, code} → 200 {access_token} + refresh cookie
+```
+
+Wrong codes increment the same `failed_attempts` a wrong password does, so holding the
+password buys a fixed number of guesses in total rather than five per challenge.
+
+Sending requires either `MAIL_RELAY_URL` (the ATS platform-mail relay) or
+`FALLBACK_SMTP_HOST`. **Configure the fallback in every environment**: it is the only
+way to sign in before the ATS has an SMTP configuration, and the only thing keeping an
+ATS outage from taking down sign-in everywhere.
 
 ## Run locally
 
@@ -88,8 +110,9 @@ four settings at this service:
 | `AUTH_AUDIENCE` | `ats` (this service's `DEFAULT_AUDIENCE`) |
 | `AUTH_JWKS_CACHE_TTL_SECONDS` | e.g. 600 |
 
-Smoke test: `POST /v1/login` here → send the `access_token` as `Bearer` to any ATS
-route → expect a JIT-provisioned user, not a 401.
+Smoke test: `POST /v1/login/challenge` here → read the code from the mail relay's
+delivery log (or your fallback mailbox) → `POST /v1/login/verify` → send the
+`access_token` as `Bearer` to any ATS route → expect a JIT-provisioned user, not a 401.
 
 VMS onboards the same way: point at this `ISSUER`/JWKS with its own `aud`.
 
@@ -103,3 +126,9 @@ VMS onboards the same way: point at this `ISSUER`/JWKS with its own `aud`.
   Multi-key JWKS (for rotation overlap) is a natural extension of `jwks()`.
 - **Rate limiting**: per-account lockout is implemented; add an edge/IP limiter
   (e.g. at the gateway) for full ADR-0005 hardening.
+- **Retiring legacy login**: `/v1/login` still issues tokens directly so products can
+  migrate one at a time. Flip `REQUIRE_OTP=true` once every client uses the challenge
+  flow — until then, an un-challenged sign-in path exists.
+- **Challenge cleanup**: consumed and expired `sign_in_challenges` rows are never
+  pruned. Harmless (they are inert) but the table grows; a retention sweep is a
+  natural follow-up.
