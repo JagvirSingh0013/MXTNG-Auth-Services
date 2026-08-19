@@ -20,7 +20,7 @@ performs authorization.
 
 - **RS256** JWT; header carries `kid`.
 - Claims: `iss` (this service), `aud` (e.g. `["ats"]`), `sub` (UUID Auth User Id),
-  `email`, `token_use=access`, `iat`/`nbf`/`exp`.
+  `email`, `token_use=access`, `sid` (session id), `iat`/`nbf`/`exp`.
 - **15-minute** access tokens; **30-day** rotating, single-use refresh tokens in an
   httpOnly cookie. Refresh reuse revokes the whole token family.
 - Verify **offline** against `GET /.well-known/jwks.json` — no shared secret.
@@ -37,8 +37,9 @@ performs authorization.
 | POST | `/v1/login/verify` | Challenge + code → access token + refresh cookie |
 | POST | `/v1/login/resend` | Mint a replacement code (invalidates the previous one) |
 | POST | `/v1/token/refresh` | Rotate refresh (cookie in → new access + cookie) |
-| POST | `/v1/logout` | Revoke this refresh family |
-| POST | `/v1/logout-all` | Revoke every refresh family for the user |
+| POST | `/v1/logout` | End this session and its refresh family |
+| POST | `/v1/logout-all` | End every session for the user |
+| POST | `/v1/sessions/introspect` | Which of these `sid`s are still live (products call this) |
 | POST | `/v1/password-reset/request` | Begin reset (no user enumeration) |
 | POST | `/v1/password-reset/confirm` | Complete reset (revokes all sessions) |
 | GET | `/v1/google/start` | Sign-in-with-Google authorization URL |
@@ -77,6 +78,30 @@ This is checked at boot rather than discovered per request:
 | No mail path, `REQUIRE_OTP=false` | Logs an error; legacy `/v1/login` still works |
 | Relay only, no fallback | Warns — a relay failure would be unrecoverable |
 | `MAIL_RELAY_SECRET` still the default | Logs an error |
+
+### One session per account (ADR-0012)
+
+Signing in ends every other session for that credential — **newest wins**, and the
+arriving device is never refused. Set `SINGLE_SESSION_PER_CREDENTIAL=false` to allow
+concurrent devices instead.
+
+Revoking a refresh token cannot deliver this on its own: products verify access
+tokens offline, and the ATS web client never refreshes at all, so an evicted device
+would keep full access until `exp` regardless. So every access token carries a `sid`,
+and products ask whether it is still live:
+
+```
+POST /v1/sessions/introspect  {"session_ids": ["<sid>", ...]}  → {"active": ["<sid>"]}
+```
+
+Unauthenticated by design: a `sid` is a random UUID readable only from a token you
+already hold, the reply is a bare boolean naming no one, and there is nothing to
+enumerate — a shared secret would add key distribution without adding secrecy. It is a
+POST so session ids stay out of access logs.
+
+A session ends when another device signs in (`superseded`), on logout, on
+`logout-all`, on password reset, and when the account is disabled. Each is recorded in
+`auth_audit_log`, and an ended session cannot be refreshed back to life.
 
 ## Run locally
 
@@ -118,6 +143,8 @@ four settings at this service:
 | `AUTH_JWKS_URL` | `<this-service>/.well-known/jwks.json` |
 | `AUTH_AUDIENCE` | `ats` (this service's `DEFAULT_AUDIENCE`) |
 | `AUTH_JWKS_CACHE_TTL_SECONDS` | e.g. 600 |
+| `AUTH_INTROSPECT_URL` | `<this-service>/v1/sessions/introspect` |
+| `AUTH_SESSION_CACHE_TTL_SECONDS` | e.g. 30 — how long an evicted device keeps working |
 
 Smoke test: `POST /v1/login/challenge` here → read the code from the mail relay's
 delivery log (or your fallback mailbox) → `POST /v1/login/verify` → send the

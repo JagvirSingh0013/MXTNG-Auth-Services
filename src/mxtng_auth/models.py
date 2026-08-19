@@ -140,3 +140,42 @@ class AuthAuditLog(Base):
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class Session(Base):
+    """One sign-in on one device. The `sid` claim in every access token points here.
+
+    Access tokens are verified offline (ADR-0006), so before this table existed
+    nothing could shorten a token's life below its `exp` — revoking a refresh
+    family was invisible to a product that never refreshes. A session id in the
+    token gives products something cheap to ask about, which is what makes
+    "one session per account" enforceable rather than merely intended.
+
+    `family_id` ties the session to its refresh chain so revoking one revokes both.
+    """
+
+    __tablename__ = "sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=_uuid, nullable=False
+    )
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("credentials.id"), index=True, nullable=False
+    )
+    audience: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Set once the session's first refresh token exists; null for a session whose
+    # product never took a refresh cookie.
+    family_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # "superseded" (another device signed in), "logout", "logout_all",
+    # "password_reset", "account_disabled". Kept for the audit trail and for
+    # telling a user why they were signed out, should a product want to.
+    revoked_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)

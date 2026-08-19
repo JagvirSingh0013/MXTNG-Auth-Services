@@ -22,6 +22,8 @@ from mxtng_auth.schemas import (
     MessageResponse,
     PasswordResetConfirm,
     PasswordResetRequest,
+    SessionIntrospectRequest,
+    SessionIntrospectResponse,
     TokenResponse,
 )
 from mxtng_auth.settings import settings
@@ -36,6 +38,11 @@ admin = APIRouter(prefix="/v1/admin", tags=["admin"])
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+def _user_agent(request: Request) -> str | None:
+    """Labels the session in the audit trail; never used as a security signal."""
+    return request.headers.get("user-agent")
 
 
 def _set_refresh_cookie(response: Response, raw: str) -> None:
@@ -115,7 +122,11 @@ async def login(payload: LoginRequest, request: Request, response: Response, db:
         db, email=payload.email, password=payload.password, ip=_client_ip(request)
     )
     access_token, expires_in, refresh_raw = await services.issue_tokens(
-        db, credential=credential, audience=payload.audience or ""
+        db,
+        credential=credential,
+        audience=payload.audience or "",
+        ip=_client_ip(request),
+        user_agent=_user_agent(request),
     )
     _set_refresh_cookie(response, refresh_raw)
     return TokenResponse(access_token=access_token, expires_in=expires_in)
@@ -145,7 +156,11 @@ async def login_verify(
     payload: ChallengeVerifyRequest, request: Request, response: Response, db: DbDep
 ) -> TokenResponse:
     access_token, expires_in, refresh_raw = await services.verify_challenge(
-        db, challenge_id=payload.challenge_id, code=payload.code, ip=_client_ip(request)
+        db,
+        challenge_id=payload.challenge_id,
+        code=payload.code,
+        ip=_client_ip(request),
+        user_agent=_user_agent(request),
     )
     _set_refresh_cookie(response, refresh_raw)
     return TokenResponse(access_token=access_token, expires_in=expires_in)
@@ -195,6 +210,31 @@ async def logout_all(request: Request, response: Response, db: DbDep) -> Respons
         await services.revoke_all_by_raw(db, raw=raw)
     _clear_refresh_cookie(response)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Sessions ---------------------------------------------------------------
+@v1.post("/sessions/introspect", response_model=SessionIntrospectResponse)
+async def sessions_introspect(
+    payload: SessionIntrospectRequest, db: DbDep
+) -> SessionIntrospectResponse:
+    """Tell a product which of these sessions are still live.
+
+    This is what makes a revocation visible to a verifier that checks signatures
+    offline (ADR-0006): the token stays valid until `exp`, but its `sid` stops
+    being live the moment another device signs in.
+
+    Unauthenticated on purpose. A `sid` is a random UUID that can only be read
+    out of a token you already hold, the answer is a bare boolean, and there is
+    nothing here to enumerate — so a shared secret would add key distribution
+    without adding secrecy. It is a POST rather than a GET so session ids stay
+    out of access logs and proxy caches.
+    """
+    active = [
+        session_id
+        for session_id in dict.fromkeys(payload.session_ids)
+        if await services.is_session_live(db, session_id)
+    ]
+    return SessionIntrospectResponse(active=active)
 
 
 # --- Password reset ---------------------------------------------------------

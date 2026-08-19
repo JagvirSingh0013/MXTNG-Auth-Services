@@ -12,8 +12,15 @@ from mxtng_auth.settings import settings
 from mxtng_auth.signer import get_signer
 
 
-def mint_access_token(*, auth_user_id: str, email: str, audience: str) -> tuple[str, int]:
-    """Return (jwt, expires_in_seconds) for a short-lived access token."""
+def mint_access_token(
+    *, auth_user_id: str, email: str, audience: str, session_id: str | None = None
+) -> tuple[str, int]:
+    """Return (jwt, expires_in_seconds) for a short-lived access token.
+
+    `sid` names the session this token belongs to. Verifiers that enforce a
+    session policy check it against the auth service; verifiers that do not
+    simply ignore it, so adding the claim breaks no existing product.
+    """
     now = int(time.time())
     expires_in = settings.ACCESS_TOKEN_TTL_SECONDS
     claims = {
@@ -26,6 +33,8 @@ def mint_access_token(*, auth_user_id: str, email: str, audience: str) -> tuple[
         "nbf": now,
         "exp": now + expires_in,
     }
+    if session_id:
+        claims["sid"] = session_id
     return get_signer().sign(claims), expires_in
 
 

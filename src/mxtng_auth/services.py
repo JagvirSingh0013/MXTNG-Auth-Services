@@ -16,6 +16,7 @@ from mxtng_auth.models import (
     Credential,
     PasswordResetToken,
     RefreshToken,
+    Session,
     SignInChallenge,
 )
 from mxtng_auth.security import (
@@ -328,7 +329,12 @@ async def resend_challenge(
 
 
 async def verify_challenge(
-    db: AsyncSession, *, challenge_id: str, code: str, ip: str | None = None
+    db: AsyncSession,
+    *,
+    challenge_id: str,
+    code: str,
+    ip: str | None = None,
+    user_agent: str | None = None,
 ) -> tuple[str, int, str]:
     """Trade a correct Sign-in Code for tokens. Wrong codes count against the same
     lockout a wrong password does, so possession of the password buys a fixed
@@ -366,22 +372,138 @@ async def verify_challenge(
     credential.locked_until = None
     await _audit(db, "otp_verified", credential_id=credential.id, email=credential.email, ip=ip)
     await db.commit()
-    return await issue_tokens(db, credential=credential, audience=challenge.audience)
+    return await issue_tokens(
+        db,
+        credential=credential,
+        audience=challenge.audience,
+        ip=ip,
+        user_agent=user_agent,
+    )
+
+
+# --- Sessions ---------------------------------------------------------------
+async def get_session(db: AsyncSession, session_id: str) -> Session | None:
+    result = await db.execute(select(Session).where(Session.session_id == session_id))
+    return result.scalar_one_or_none()
+
+
+async def is_session_live(db: AsyncSession, session_id: str) -> bool:
+    """The question products ask on every request (via a cache). Unknown ids are
+    dead: a token minted before this table existed carries no `sid` at all, and a
+    `sid` we have never issued is not one of ours."""
+    session = await get_session(db, session_id)
+    return session is not None and not session.revoked
+
+
+async def revoke_sessions_for_credential(
+    db: AsyncSession, *, credential_id: int, reason: str
+) -> list[Session]:
+    """Kill every live session for the account and the refresh family behind each.
+    Returns what was killed, for the audit trail."""
+    result = await db.execute(
+        select(Session).where(
+            Session.credential_id == credential_id,
+            Session.revoked.is_(False),
+        )
+    )
+    revoked: list[Session] = []
+    for session in result.scalars().all():
+        session.revoked = True
+        session.revoked_reason = reason
+        session.revoked_at = _now()
+        if session.family_id:
+            await _revoke_family(db, family_id=session.family_id)
+        revoked.append(session)
+    return revoked
+
+
+async def _start_session(
+    db: AsyncSession,
+    *,
+    credential: Credential,
+    audience: str,
+    ip: str | None,
+    user_agent: str | None,
+    supersede: bool,
+) -> Session:
+    """Open a session, applying the one-session policy when this is a sign-in.
+
+    Newest wins: the arriving device is never refused, the older ones are ended.
+    Refusing instead would let a forgotten session on a closed laptop lock a
+    legitimate user out of their own account.
+    """
+    if supersede and settings.SINGLE_SESSION_PER_CREDENTIAL:
+        superseded = await revoke_sessions_for_credential(
+            db, credential_id=credential.id, reason="superseded"
+        )
+        for old in superseded:
+            await _audit(
+                db,
+                "session_superseded",
+                credential_id=credential.id,
+                ip=ip,
+                detail=f"session={old.session_id}",
+            )
+
+    session = Session(
+        credential_id=credential.id,
+        audience=audience,
+        ip=ip,
+        # Long UAs are common and the column is a label, not evidence.
+        user_agent=user_agent[:255] if user_agent else None,
+    )
+    db.add(session)
+    await db.flush()
+    await _audit(
+        db,
+        "session_started",
+        credential_id=credential.id,
+        ip=ip,
+        detail=f"session={session.session_id}",
+    )
+    return session
 
 
 # --- Refresh-token issuance & rotation --------------------------------------
 async def issue_tokens(
-    db: AsyncSession, *, credential: Credential, audience: str, family_id: str | None = None
+    db: AsyncSession,
+    *,
+    credential: Credential,
+    audience: str,
+    family_id: str | None = None,
+    session_id: str | None = None,
+    ip: str | None = None,
+    user_agent: str | None = None,
+    supersede_others: bool = True,
 ) -> tuple[str, int, str]:
     """Return (access_token, expires_in, refresh_raw). Starts a new family unless
     continuing an existing one during rotation.
 
-    A `family_id`-less call means a brand-new session (fresh login, not a
-    refresh). Concurrent sessions are allowed: a user may be logged in on as
-    many devices as they like, each with its own independent token family."""
+    A `session_id`-less call means a brand-new sign-in rather than a refresh, and
+    that is where the one-session-per-account policy is applied. Rotation passes
+    the existing session through so refreshing a token never evicts yourself."""
     audience = resolve_audience(audience)
+
+    if session_id is None:
+        session = await _start_session(
+            db,
+            credential=credential,
+            audience=audience,
+            ip=ip,
+            user_agent=user_agent,
+            supersede=supersede_others,
+        )
+        session_id = session.session_id
+    else:
+        session = await get_session(db, session_id)
+        if session is not None:
+            session.last_seen_at = _now()
+
     access_token, expires_in = mint_access_token(
-        auth_user_id=credential.auth_user_id, email=credential.email, audience=audience
+        auth_user_id=credential.auth_user_id,
+        email=credential.email,
+        audience=audience,
+        session_id=session_id,
     )
     raw = new_opaque_token()
     refresh = RefreshToken(
@@ -393,6 +515,9 @@ async def issue_tokens(
     if family_id:
         refresh.family_id = family_id
     db.add(refresh)
+    await db.flush()
+    if session is not None and not session.family_id:
+        session.family_id = refresh.family_id
     await db.commit()
     return access_token, expires_in, raw
 
@@ -425,14 +550,33 @@ async def rotate_refresh(db: AsyncSession, *, raw: str, ip: str | None = None) -
     if credential is None or credential.disabled:
         raise AccountDisabled("This account has been disabled")
 
+    # An evicted device must not be able to refresh its way back in — that would
+    # make the one-session policy a speed bump rather than a rule.
+    session = await _get_session_by_family(db, family_id=token.family_id)
+    if session is not None and session.revoked:
+        raise InvalidRefresh("This session has ended")
+
     token.rotated = True
     await db.commit()
     access_token, expires_in, new_raw = await issue_tokens(
-        db, credential=credential, audience=token.audience, family_id=token.family_id
+        db,
+        credential=credential,
+        audience=token.audience,
+        family_id=token.family_id,
+        session_id=session.session_id if session is not None else None,
+        ip=ip,
+        # A token family predating sessions gets one now, but adopting it is not a
+        # sign-in and must not evict the user's other devices.
+        supersede_others=False,
     )
     await _audit(db, "refresh_rotated", credential_id=credential.id, ip=ip)
     await db.commit()
     return access_token, expires_in, new_raw
+
+
+async def _get_session_by_family(db: AsyncSession, *, family_id: str) -> Session | None:
+    result = await db.execute(select(Session).where(Session.family_id == family_id))
+    return result.scalars().first()
 
 
 async def _revoke_family(db: AsyncSession, *, family_id: str) -> None:
@@ -451,6 +595,11 @@ async def revoke_by_raw(db: AsyncSession, *, raw: str) -> None:
     token = result.scalar_one_or_none()
     if token is not None:
         await _revoke_family(db, family_id=token.family_id)
+        session = await _get_session_by_family(db, family_id=token.family_id)
+        if session is not None and not session.revoked:
+            session.revoked = True
+            session.revoked_reason = "logout"
+            session.revoked_at = _now()
         await _audit(db, "logout", credential_id=token.credential_id)
         await db.commit()
 
@@ -468,13 +617,16 @@ async def revoke_all_by_raw(db: AsyncSession, *, raw: str) -> None:
         await revoke_all_for_credential(db, credential=credential)
 
 
-async def revoke_all_for_credential(db: AsyncSession, *, credential: Credential) -> None:
-    """Force-logout / password change: revoke every refresh family for the user."""
+async def revoke_all_for_credential(
+    db: AsyncSession, *, credential: Credential, reason: str = "logout_all"
+) -> None:
+    """Force-logout / password change: end every session and refresh family."""
     result = await db.execute(
         select(RefreshToken).where(RefreshToken.credential_id == credential.id)
     )
     for token in result.scalars().all():
         token.revoked = True
+    await revoke_sessions_for_credential(db, credential_id=credential.id, reason=reason)
     await _audit(db, "logout_all", credential_id=credential.id)
     await db.commit()
 
@@ -546,8 +698,8 @@ async def confirm_password_reset(
     token.used = True
     await _audit(db, "password_reset_confirmed", credential_id=credential.id, ip=ip)
     await db.commit()
-    # A password change revokes renewal everywhere.
-    await revoke_all_for_credential(db, credential=credential)
+    # A password change ends every session everywhere.
+    await revoke_all_for_credential(db, credential=credential, reason="password_reset")
 
 
 # --- Google Sign-in ---------------------------------------------------------
@@ -593,5 +745,5 @@ async def disable_credential(db: AsyncSession, *, credential: Credential) -> Non
     credential.disabled = True
     await _audit(db, "account_disabled", credential_id=credential.id)
     await db.commit()
-    await revoke_all_for_credential(db, credential=credential)
+    await revoke_all_for_credential(db, credential=credential, reason="account_disabled")
     await events.emit(events.ACCOUNT_DISABLED, auth_user_id=credential.auth_user_id, data={})

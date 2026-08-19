@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     LOGIN_LOCKOUT_SECONDS: int = 15 * 60
     RESET_TOKEN_TTL_SECONDS: int = 30 * 60
 
+    # --- Session policy -----------------------------------------------------
+    # One live session per credential: signing in anywhere revokes every other
+    # session for that account, newest wins. Set False to allow concurrent
+    # devices (the pre-existing behaviour).
+    SINGLE_SESSION_PER_CREDENTIAL: bool = True
+
     # --- Sign-in challenge (emailed OTP, ADR-0011) --------------------------
     # False keeps legacy `/v1/login` issuing tokens directly so products can
     # migrate one at a time; flipping it to True closes that path for good.

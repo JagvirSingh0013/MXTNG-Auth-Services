@@ -50,6 +50,22 @@ class TokenResponse(BaseModel):
     expires_in: int
 
 
+# --- Sessions ---------------------------------------------------------------
+class SessionIntrospectRequest(BaseModel):
+    """`sid` claims a product wants to check. A list so a busy verifier can refill
+    its cache in one call instead of one round trip per session."""
+
+    session_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class SessionIntrospectResponse(BaseModel):
+    """Only the live ids come back. Deliberately says nothing about who owns a
+    session or why a missing one is missing — a liveness check must not double as
+    an identity oracle."""
+
+    active: list[str]
+
+
 # --- Password reset ---------------------------------------------------------
 class PasswordResetRequest(BaseModel):
     email: EmailStr
