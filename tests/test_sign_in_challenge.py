@@ -235,3 +235,22 @@ async def test_password_reset_is_actually_emailed_now(client, outbox):
     assert outbox[0]["purpose"] == mail.PURPOSE_PASSWORD_RESET
     # A 30-minute token tolerates the outbox; a 5-minute code does not.
     assert outbox[0]["mode"] == mail.MODE_QUEUED
+
+
+async def test_a_delivery_failure_reports_both_causes(monkeypatch):
+    """The fallback's own complaint is the least useful half. Without the relay
+    error beside it, an operator cannot tell a misconfigured URL from a bad secret
+    from an SMTP rejection."""
+    monkeypatch.setattr(settings, "MAIL_RELAY_URL", None)
+    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
+
+    message = mail.render_sign_in_code(code="123456", ttl_seconds=300, requested_at=services._now())
+    with pytest.raises(mail.MailUndeliverable) as caught:
+        await mail.send(
+            to_email=EMAIL, message=message,
+            purpose=mail.PURPOSE_SIGN_IN_CODE, mode=mail.MODE_INLINE,
+        )
+
+    reported = str(caught.value)
+    assert "relay failed" in reported
+    assert "fallback failed" in reported

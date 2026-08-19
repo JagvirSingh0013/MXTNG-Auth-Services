@@ -193,7 +193,16 @@ async def send(*, to_email: str, message: RenderedMessage, purpose: str, mode: s
         await _send_via_relay(to_email=to_email, message=message, purpose=purpose, mode=mode)
         return "relay"
     except (MailUndeliverable, httpx.HTTPError) as exc:
+        relay_error = exc
         logger.warning("Mail relay unavailable for %s (%s); trying fallback SMTP", purpose, exc)
 
-    await _send_via_fallback(to_email=to_email, message=message)
+    try:
+        await _send_via_fallback(to_email=to_email, message=message)
+    except MailUndeliverable as exc:
+        # Report BOTH causes. The fallback's own message ("no fallback SMTP
+        # configured") is the least interesting half — without the relay error
+        # beside it, the audit row says nothing about why delivery actually failed.
+        raise MailUndeliverable(
+            f"relay failed ({relay_error}); fallback failed ({exc})"
+        ) from exc
     return "fallback"
