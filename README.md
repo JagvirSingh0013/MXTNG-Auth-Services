@@ -69,6 +69,15 @@ Sending requires either `MAIL_RELAY_URL` (the ATS platform-mail relay) or
 way to sign in before the ATS has an SMTP configuration, and the only thing keeping an
 ATS outage from taking down sign-in everywhere.
 
+This is checked at boot rather than discovered per request:
+
+| Configuration | Behaviour at startup |
+|---|---|
+| No mail path, `REQUIRE_OTP=true` | **Refuses to start** — every sign-in would 502 |
+| No mail path, `REQUIRE_OTP=false` | Logs an error; legacy `/v1/login` still works |
+| Relay only, no fallback | Warns — a relay failure would be unrecoverable |
+| `MAIL_RELAY_SECRET` still the default | Logs an error |
+
 ## Run locally
 
 ```bash

@@ -254,3 +254,55 @@ async def test_a_delivery_failure_reports_both_causes(monkeypatch):
     reported = str(caught.value)
     assert "relay failed" in reported
     assert "fallback failed" in reported
+
+
+# --- Startup configuration check --------------------------------------------
+def test_startup_refuses_when_otp_is_required_but_nothing_can_send(monkeypatch):
+    """Starting up is worse than not starting: every sign-in would 502, far from
+    the cause."""
+    from mxtng_auth.main import MailNotConfigured, check_mail_configuration
+
+    monkeypatch.setattr(settings, "REQUIRE_OTP", True)
+    monkeypatch.setattr(settings, "MAIL_RELAY_URL", None)
+    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
+
+    with pytest.raises(MailNotConfigured, match="No mail path configured"):
+        check_mail_configuration()
+
+
+def test_startup_only_complains_while_legacy_login_still_works(monkeypatch, caplog):
+    from mxtng_auth.main import check_mail_configuration
+
+    monkeypatch.setattr(settings, "REQUIRE_OTP", False)
+    monkeypatch.setattr(settings, "MAIL_RELAY_URL", None)
+    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
+
+    with caplog.at_level("ERROR"):
+        check_mail_configuration()  # must not raise
+    assert "No mail path configured" in caplog.text
+
+
+def test_startup_warns_when_only_the_relay_is_configured(monkeypatch, caplog):
+    """A relay without a fallback is the unrecoverable case: if it breaks, nobody
+    can sign in to fix it."""
+    from mxtng_auth.main import check_mail_configuration
+
+    monkeypatch.setattr(settings, "MAIL_RELAY_URL", "http://ats.test/api/v1/internal/mail")
+    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", "a-real-secret")
+    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
+
+    with caplog.at_level("WARNING"):
+        check_mail_configuration()
+    assert "FALLBACK_SMTP_HOST" in caplog.text
+
+
+def test_startup_flags_a_default_relay_secret(monkeypatch, caplog):
+    from mxtng_auth.main import check_mail_configuration
+
+    monkeypatch.setattr(settings, "MAIL_RELAY_URL", "http://ats.test/api/v1/internal/mail")
+    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", "change-me-mail-relay-secret")
+    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", "smtp.example.test")
+
+    with caplog.at_level("ERROR"):
+        check_mail_configuration()
+    assert "MAIL_RELAY_SECRET" in caplog.text
