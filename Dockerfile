@@ -3,8 +3,9 @@ FROM python:3.13-slim
 WORKDIR /app
 
 # Install deps first for layer caching.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
+COPY migrations ./migrations
 RUN pip install --no-cache-dir ".[postgres,google]"
 
 ENV ENVIRONMENT=production
