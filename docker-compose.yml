@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: auth
       POSTGRES_DB: mxtng_auth
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - auth_pgdata:/var/lib/postgresql/data
 
