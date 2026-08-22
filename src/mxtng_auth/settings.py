@@ -85,13 +85,16 @@ class Settings(BaseSettings):
     MAIL_FROM_EMAIL: str = "no-reply@mxtng.local"
     MAIL_FROM_NAME: str = "MXTNG"
     # Product page that trades a reset token for a new password.
-    PASSWORD_RESET_URL: str | None = "http://localhost:3000/reset-password"
+    PASSWORD_RESET_URL: str | None = "https://ats-iota-five.vercel.app/reset-password"
 
     # --- Admin (service-to-service) ----------------------------------------
     ADMIN_API_KEY: str = "change-me-admin-key"
 
     # --- CORS ---------------------------------------------------------------
-    CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "https://ats-iota-five.vercel.app",
+    ]
 
     @property
     def google_enabled(self) -> bool:
