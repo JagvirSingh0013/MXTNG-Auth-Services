@@ -74,7 +74,17 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="MXTNG Auth Service", version="0.1.0", lifespan=lifespan)
+    # Disable interactive API docs and the OpenAPI schema in production — they
+    # enumerate every route/schema and must not be publicly reachable there.
+    docs_enabled = settings.ENVIRONMENT.lower() != "production"
+    app = FastAPI(
+        title="MXTNG Auth Service",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
     cors_origins = list(dict.fromkeys((*settings.CORS_ORIGINS, *FALLBACK_CORS_ORIGINS)))
 
     app.add_middleware(
