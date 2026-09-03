@@ -1,6 +1,9 @@
 """Runtime configuration. Token-contract fields must match each product's verifier."""
 from __future__ import annotations
 
+from typing import Literal
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +33,13 @@ class Settings(BaseSettings):
     REFRESH_COOKIE_SECURE: bool = True
     REFRESH_COOKIE_DOMAIN: str | None = None
     REFRESH_COOKIE_PATH: str = "/v1/token"
+    # "lax" only reaches the browser on a cross-origin refresh when the product and
+    # this service share a registrable domain (app.mxtng.com -> auth.mxtng.com). A
+    # product on an unrelated host (a *.vercel.app preview, say) is cross-site, and
+    # a lax cookie is simply not sent — refresh 401s and the session dies with the
+    # access token. Such a deployment must set "none", which browsers only honour
+    # alongside Secure.
+    REFRESH_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
 
     # --- Login hardening ----------------------------------------------------
     MAX_FAILED_LOGINS: int = 5
@@ -97,6 +107,15 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "https://ats-iota-five.vercel.app",
     ]
+
+    @model_validator(mode="after")
+    def _check_cookie_policy(self) -> "Settings":
+        if self.REFRESH_COOKIE_SAMESITE == "none" and not self.REFRESH_COOKIE_SECURE:
+            raise ValueError(
+                "REFRESH_COOKIE_SAMESITE=none requires REFRESH_COOKIE_SECURE=true; "
+                "browsers drop the cookie otherwise."
+            )
+        return self
 
     @property
     def google_enabled(self) -> bool:

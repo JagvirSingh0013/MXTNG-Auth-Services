@@ -82,6 +82,9 @@ PRIVATE_KEY_PATH=/app/signing_key.pem         # mounted in Step 8
 CORS_ORIGINS=["https://app.mxtng.com"]        # your frontend origin(s)
 REFRESH_COOKIE_SECURE=true
 REFRESH_COOKIE_DOMAIN=.mxtng.com              # cookie works across *.mxtng.com
+REFRESH_COOKIE_SAMESITE=lax                   # "none" if the frontend is on an
+                                              # unrelated domain (e.g. *.vercel.app);
+                                              # cross-site cookies need Secure too
 WEBHOOK_SECRET=<openssl rand -hex 32>
 ADMIN_API_KEY=<openssl rand -hex 32>
 # Optional Google login:

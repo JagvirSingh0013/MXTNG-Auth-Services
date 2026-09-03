@@ -52,7 +52,7 @@ def _set_refresh_cookie(response: Response, raw: str) -> None:
         max_age=settings.REFRESH_TOKEN_TTL_SECONDS,
         httponly=True,
         secure=settings.REFRESH_COOKIE_SECURE,
-        samesite="lax",
+        samesite=settings.REFRESH_COOKIE_SAMESITE,
         path=settings.REFRESH_COOKIE_PATH,
         domain=settings.REFRESH_COOKIE_DOMAIN,
     )
@@ -75,10 +75,14 @@ def _challenge_response(challenge, email: str) -> ChallengeResponse:
 
 
 def _clear_refresh_cookie(response: Response) -> None:
+    # The attributes must match the cookie that was set, or the browser keeps it.
     response.delete_cookie(
         key=settings.REFRESH_COOKIE_NAME,
         path=settings.REFRESH_COOKIE_PATH,
         domain=settings.REFRESH_COOKIE_DOMAIN,
+        httponly=True,
+        secure=settings.REFRESH_COOKIE_SECURE,
+        samesite=settings.REFRESH_COOKIE_SAMESITE,
     )
 
 
