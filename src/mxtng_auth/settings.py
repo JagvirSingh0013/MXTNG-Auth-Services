@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     OTP_MAX_ATTEMPTS: int = 5
     OTP_RESEND_COOLDOWN_SECONDS: int = 60
     OTP_MAX_SENDS_PER_CHALLENGE: int = 3
+    #: How long after it was created a challenge may still be resent to.
+    #: A resend accepts an *expired* challenge on purpose — replacing a code that
+    #: ran out is the whole point of the button — so `expires_at` no longer bounds
+    #: how long a challenge id stays useful. This does. A challenge id is not a
+    #: secret (ADR-0011 rides it in a redirect URL), so one recovered later from
+    #: history or a referrer must not still be able to mail its owner.
+    OTP_CHALLENGE_MAX_AGE_SECONDS: int = 30 * 60
 
     # --- Sign-in-with-Google (optional) ------------------------------------
     GOOGLE_CLIENT_ID: str | None = None

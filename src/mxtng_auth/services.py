@@ -329,12 +329,49 @@ async def _load_live_challenge(db: AsyncSession, challenge_id: str) -> SignInCha
     return challenge
 
 
+async def _load_resendable_challenge(
+    db: AsyncSession, challenge_id: str
+) -> SignInChallenge:
+    """Like `_load_live_challenge`, but an expired challenge is allowed through.
+
+    Resend used the live loader, which meant the button could not replace a code
+    that had run out — the one situation it exists for. With a 5-minute TTL and a
+    60-second cooldown it only ever worked between those two marks; past
+    `OTP_TTL_SECONDS` it answered 401 `invalid_challenge`, which reads as "your
+    code is wrong" to someone who never typed one. ADR-0011 says a resend
+    "restarts the window", and a window that has closed is exactly the one worth
+    restarting.
+
+    What still refuses:
+
+    * `consumed` — the challenge was verified, superseded by a newer sign-in, or
+      burnt by the attempt cap. None of those should be revivable.
+    * older than `OTP_CHALLENGE_MAX_AGE_SECONDS` — expiry no longer bounds how
+      long the id stays useful, so an absolute age does.
+
+    Reviving grants no guesses. The emailed code is still required, the total
+    number of codes is still capped by `OTP_MAX_SENDS_PER_CHALLENGE`, and a wrong
+    code still feeds the credential-wide lockout ADR-0011 chose on purpose.
+    """
+    result = await db.execute(
+        select(SignInChallenge).where(SignInChallenge.challenge_id == challenge_id)
+    )
+    challenge = result.scalar_one_or_none()
+    if challenge is None or challenge.consumed:
+        raise InvalidChallenge("Invalid or expired sign-in code")
+
+    age = (_now() - _aware(challenge.created_at)).total_seconds()
+    if age > settings.OTP_CHALLENGE_MAX_AGE_SECONDS:
+        raise InvalidChallenge("This sign-in has expired. Please sign in again.")
+    return challenge
+
+
 async def resend_challenge(
     db: AsyncSession, *, challenge_id: str, ip: str | None = None
 ) -> SignInChallenge:
     """Mint a fresh code and restart the window. The previous code stops working —
     which is why the email carries the time it was requested."""
-    challenge = await _load_live_challenge(db, challenge_id)
+    challenge = await _load_resendable_challenge(db, challenge_id)
 
     since_last = (_now() - _aware(challenge.last_sent_at)).total_seconds()
     if since_last < settings.OTP_RESEND_COOLDOWN_SECONDS:

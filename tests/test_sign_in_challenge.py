@@ -155,6 +155,77 @@ async def test_resend_is_rate_limited(client, outbox):
     assert len(outbox) == 1
 
 
+async def test_resend_replaces_a_code_that_already_expired(client, outbox, monkeypatch):
+    """The case the button exists for.
+
+    Resend shared `_load_live_challenge` with verify, so once `OTP_TTL_SECONDS`
+    had passed it answered 401 `invalid_challenge` — "your code is wrong" to
+    someone who had not typed one. With a 60s cooldown on a 5-minute window that
+    left resend usable only between those two marks.
+    """
+    monkeypatch.setattr(settings, "OTP_RESEND_COOLDOWN_SECONDS", 0)
+    # Born already expired, so no clock has to be faked.
+    monkeypatch.setattr(settings, "OTP_TTL_SECONDS", -1)
+    await _signup(client)
+    challenge = (await _challenge(client)).json()
+
+    # Verify keeps refusing it: reviving is a resend concession, not a general one.
+    dead = await client.post(
+        "/v1/login/verify",
+        json={"challenge_id": challenge["challenge_id"], "code": _code_from(outbox[0])},
+    )
+    assert dead.status_code == 401
+
+    monkeypatch.setattr(settings, "OTP_TTL_SECONDS", 5 * 60)
+    resend = await client.post(
+        "/v1/login/resend", json={"challenge_id": challenge["challenge_id"]}
+    )
+    assert resend.status_code == 202
+    assert resend.json()["challenge_id"] == challenge["challenge_id"]
+
+    revived = await client.post(
+        "/v1/login/verify",
+        json={"challenge_id": challenge["challenge_id"], "code": _code_from(outbox[1])},
+    )
+    assert revived.status_code == 200
+
+
+async def test_resend_refuses_a_challenge_past_its_absolute_age(client, outbox, monkeypatch):
+    """Expiry no longer bounds how long a challenge id is worth anything, so the
+    age ceiling has to: the id is not a secret and can turn up later in history."""
+    monkeypatch.setattr(settings, "OTP_RESEND_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(settings, "OTP_CHALLENGE_MAX_AGE_SECONDS", -1)
+    await _signup(client)
+    challenge = (await _challenge(client)).json()
+
+    too_old = await client.post(
+        "/v1/login/resend", json={"challenge_id": challenge["challenge_id"]}
+    )
+    assert too_old.status_code == 401
+    assert len(outbox) == 1
+
+
+async def test_resend_refuses_a_superseded_challenge(client, outbox, monkeypatch):
+    """`consumed` still means dead. A newer sign-in supersedes the old challenge,
+    and resurrecting it would mail a code for a sign-in nobody is waiting on."""
+    monkeypatch.setattr(settings, "OTP_RESEND_COOLDOWN_SECONDS", 0)
+    await _signup(client)
+    first = (await _challenge(client)).json()
+    await _challenge(client)
+
+    stale = await client.post(
+        "/v1/login/resend", json={"challenge_id": first["challenge_id"]}
+    )
+    assert stale.status_code == 401
+
+
+async def test_resend_of_an_unknown_challenge_is_rejected(client, outbox):
+    response = await client.post(
+        "/v1/login/resend", json={"challenge_id": "not-a-challenge"}
+    )
+    assert response.status_code == 401
+
+
 async def test_unknown_challenge_is_rejected(client, outbox):
     response = await client.post(
         "/v1/login/verify", json={"challenge_id": "not-a-challenge", "code": "123456"}
