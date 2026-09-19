@@ -154,6 +154,7 @@ class Settings(BaseSettings):
     # --- HTTP hardening -----------------------------------------------------
     CORS_ORIGINS: list[str] = [
         "http://localhost:3000",
+        "https://dashboard.mxtng.com",
         "https://ats-iota-five.vercel.app",
     ]
     #: Host header allow-list. "*" is refused in production by `_enforce_secrets`.

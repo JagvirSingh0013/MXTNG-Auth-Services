@@ -20,7 +20,18 @@ logger = logging.getLogger(__name__)
 # Keep the production ATS web application reachable even if an older deployment
 # omits it from CORS_ORIGINS. Additional product origins remain configurable via
 # the environment variable.
-FALLBACK_CORS_ORIGINS = ("https://ats-iota-five.vercel.app",)
+#
+# `dashboard.mxtng.com` is the canonical product origin and is listed here, not
+# only in the default, because CORSMiddleware answers an unlisted Origin with no
+# `Access-Control-Allow-Origin` at all: the browser reports that as a bare CORS
+# failure, so a stale `CORS_ORIGINS` on the box takes sign-in down and says
+# nothing about why. Only origins this product is known to serve from belong
+# here: the list is credentialed, and a name that is allow-listed but no longer
+# resolves anywhere is a subdomain-takeover foothold.
+FALLBACK_CORS_ORIGINS = (
+    "https://dashboard.mxtng.com",
+    "https://ats-iota-five.vercel.app",
+)
 
 
 class MailNotConfigured(RuntimeError):

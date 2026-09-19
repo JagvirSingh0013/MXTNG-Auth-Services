@@ -79,7 +79,15 @@ DEFAULT_AUDIENCE=ats
 ALLOWED_AUDIENCES=["ats","vms"]
 DATABASE_URL=postgresql+asyncpg://auth_user:strongpass@<db-host>:5432/mxtng_auth
 PRIVATE_KEY_PATH=/app/signing_key.pem         # mounted in Step 8
-CORS_ORIGINS=["https://app.mxtng.com"]        # your frontend origin(s)
+CORS_ORIGINS=["https://dashboard.mxtng.com"]  # EVERY browser origin that calls this
+                                              # service. An origin missing here gets no
+                                              # Access-Control-Allow-Origin at all, which
+                                              # the browser reports only as "blocked by
+                                              # CORS policy" — sign-in dies silently.
+TRUSTED_HOSTS=["auth.mxtng.com"]              # Host allow-list. Production refuses to boot
+                                              # on "*", and an unlisted Host is rejected
+                                              # *before* CORS runs, so that 400 also
+                                              # reaches the browser as a CORS error.
 REFRESH_COOKIE_SECURE=true
 REFRESH_COOKIE_DOMAIN=.mxtng.com              # cookie works across *.mxtng.com
 REFRESH_COOKIE_SAMESITE=lax                   # "none" if the frontend is on an
@@ -200,7 +208,8 @@ docker exec mxtng-auth alembic upgrade head
 - [ ] `signing_key.pem` is `chmod 600`, backed up, and identical across any future instances.
 - [ ] `ADMIN_API_KEY` and `WEBHOOK_SECRET` are random 32-byte hex, not defaults.
 - [ ] `REFRESH_COOKIE_SECURE=true` and HTTPS enforced.
-- [ ] `CORS_ORIGINS` lists only your real frontend origin(s).
+- [ ] `CORS_ORIGINS` lists every real frontend origin, and only those.
+- [ ] `TRUSTED_HOSTS` names this deployment's public host(s), never `"*"`.
 - [ ] DB is not publicly reachable; strong password / RDS security group.
 - [ ] certbot auto-renew is active (`systemctl status certbot.timer`).
 
