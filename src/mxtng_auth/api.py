@@ -26,7 +26,8 @@ from mxtng_auth.schemas import (
     SessionIntrospectResponse,
     TokenResponse,
 )
-from mxtng_auth.settings import settings
+from mxtng_auth.ratelimit import client_ip, rate_limit
+from mxtng_auth.settings import reveal, settings
 from mxtng_auth.signer import get_signer
 
 DbDep = Annotated[AsyncSession, Depends(get_db)]
@@ -37,7 +38,9 @@ admin = APIRouter(prefix="/v1/admin", tags=["admin"])
 
 
 def _client_ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
+    """Delegates to the shared helper so the audit trail and the rate limiter
+    always agree on who the caller is (SECURITY_AUDIT L-6)."""
+    return client_ip(request)
 
 
 def _user_agent(request: Request) -> str | None:
@@ -98,7 +101,12 @@ async def jwks() -> dict:
 
 
 # --- Signup (idempotent) ----------------------------------------------------
-@v1.post("/credentials", response_model=CredentialRead, status_code=status.HTTP_201_CREATED)
+@v1.post(
+    "/credentials",
+    response_model=CredentialRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit("signup", "RATE_LIMIT_SIGNUP_PER_MINUTE"))],
+)
 async def create_credential(
     payload: CredentialCreate,
     request: Request,
@@ -116,24 +124,13 @@ async def create_credential(
 
 
 # --- Login / refresh / logout ----------------------------------------------
-@v1.post("/login", response_model=TokenResponse, deprecated=True)
-async def login(payload: LoginRequest, request: Request, response: Response, db: DbDep) -> TokenResponse:
-    """Legacy single-step sign-in, kept alive only so products can migrate to the
-    challenge flow one at a time. `REQUIRE_OTP=true` closes it (ADR-0011)."""
-    if settings.REQUIRE_OTP:
-        raise services.OtpRequired("Single-step sign-in is retired. Use /v1/login/challenge.")
-    credential = await services.authenticate(
-        db, email=payload.email, password=payload.password, ip=_client_ip(request)
-    )
-    access_token, expires_in, refresh_raw = await services.issue_tokens(
-        db,
-        credential=credential,
-        audience=payload.audience or "",
-        ip=_client_ip(request),
-        user_agent=_user_agent(request),
-    )
-    _set_refresh_cookie(response, refresh_raw)
-    return TokenResponse(access_token=access_token, expires_in=expires_in)
+# The legacy single-step `POST /v1/login` was removed (SECURITY_AUDIT C-2).
+# It issued tokens on a password alone, so nothing in the sign-in path ever
+# proved the person controlled the mailbox — and the ATS turns an email domain
+# into agency membership. It lived behind a `REQUIRE_OTP` flag that defaulted to
+# off; a flag that can re-enable a critical hole is not a mitigation, so both the
+# route and the flag are gone. Every product now signs in through
+# /v1/login/challenge + /v1/login/verify.
 
 
 # --- Sign-in challenge (ADR-0011) -------------------------------------------
@@ -141,6 +138,7 @@ async def login(payload: LoginRequest, request: Request, response: Response, db:
     "/login/challenge",
     response_model=ChallengeResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(rate_limit("login", "RATE_LIMIT_LOGIN_PER_MINUTE"))],
 )
 async def login_challenge(
     payload: LoginRequest, request: Request, db: DbDep
@@ -155,7 +153,11 @@ async def login_challenge(
     return _challenge_response(challenge, credential.email)
 
 
-@v1.post("/login/verify", response_model=TokenResponse)
+@v1.post(
+    "/login/verify",
+    response_model=TokenResponse,
+    dependencies=[Depends(rate_limit("login", "RATE_LIMIT_LOGIN_PER_MINUTE"))],
+)
 async def login_verify(
     payload: ChallengeVerifyRequest, request: Request, response: Response, db: DbDep
 ) -> TokenResponse:
@@ -174,6 +176,7 @@ async def login_verify(
     "/login/resend",
     response_model=ChallengeResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(rate_limit("login", "RATE_LIMIT_LOGIN_PER_MINUTE"))],
 )
 async def login_resend(
     payload: ChallengeResendRequest, request: Request, db: DbDep
@@ -217,7 +220,11 @@ async def logout_all(request: Request, response: Response, db: DbDep) -> Respons
 
 
 # --- Sessions ---------------------------------------------------------------
-@v1.post("/sessions/introspect", response_model=SessionIntrospectResponse)
+@v1.post(
+    "/sessions/introspect",
+    response_model=SessionIntrospectResponse,
+    dependencies=[Depends(rate_limit("introspect", "RATE_LIMIT_INTROSPECT_PER_MINUTE"))],
+)
 async def sessions_introspect(
     payload: SessionIntrospectRequest, db: DbDep
 ) -> SessionIntrospectResponse:
@@ -232,30 +239,41 @@ async def sessions_introspect(
     nothing here to enumerate — so a shared secret would add key distribution
     without adding secrecy. It is a POST rather than a GET so session ids stay
     out of access logs and proxy caches.
+
+    Answered with a single `IN` query and rate-limited per IP: the previous
+    per-id loop turned one cheap anonymous request into up to a hundred
+    sequential round trips (SECURITY_AUDIT M-2).
     """
-    active = [
-        session_id
-        for session_id in dict.fromkeys(payload.session_ids)
-        if await services.is_session_live(db, session_id)
-    ]
+    active = await services.live_session_ids(db, payload.session_ids)
     return SessionIntrospectResponse(active=active)
 
 
 # --- Password reset ---------------------------------------------------------
-@v1.post("/password-reset/request", response_model=MessageResponse)
+@v1.post(
+    "/password-reset/request",
+    response_model=MessageResponse,
+    dependencies=[Depends(rate_limit("password_reset", "RATE_LIMIT_RESET_PER_MINUTE"))],
+)
 async def password_reset_request(
     payload: PasswordResetRequest, request: Request, db: DbDep
 ) -> MessageResponse:
     raw = await services.request_password_reset(
         db, email=payload.email, ip=_client_ip(request)
     )
-    # Never reveal whether the email exists. In dev, surface the token to ease testing.
-    if raw and settings.ENVIRONMENT != "production":
+    # Never reveal whether the email exists. The developer convenience of getting
+    # the token back is opt-in and development-only (SECURITY_AUDIT M-10): the
+    # old `!= "production"` test handed live reset tokens to anonymous callers on
+    # staging, on any typo'd ENVIRONMENT, and whenever the variable was unset.
+    if raw and settings.DEBUG_ECHO_RESET_TOKENS and settings.is_development:
         return MessageResponse(message=f"reset_token={raw}")
     return MessageResponse(message="If that email exists, a reset link has been sent.")
 
 
-@v1.post("/password-reset/confirm", response_model=MessageResponse)
+@v1.post(
+    "/password-reset/confirm",
+    response_model=MessageResponse,
+    dependencies=[Depends(rate_limit("password_reset", "RATE_LIMIT_RESET_PER_MINUTE"))],
+)
 async def password_reset_confirm(
     payload: PasswordResetConfirm, request: Request, db: DbDep
 ) -> MessageResponse:
@@ -271,22 +289,37 @@ def _require_google() -> None:
         raise HTTPException(status_code=501, detail="Google sign-in is not configured")
 
 
-@v1.get("/google/start", response_model=GoogleAuthStart)
-async def google_start() -> GoogleAuthStart:
+@v1.get(
+    "/google/start",
+    response_model=GoogleAuthStart,
+    dependencies=[Depends(rate_limit("login", "RATE_LIMIT_LOGIN_PER_MINUTE"))],
+)
+async def google_start(db: DbDep) -> GoogleAuthStart:
     _require_google()
     from mxtng_auth.google import build_authorization_url
 
-    # NOTE: stateless CSRF nonce passthrough; a persistent state store is a follow-up.
-    state = secrets.token_urlsafe(24)
+    # Persisted, single-use and short-lived — see services.issue_oauth_state.
+    state = await services.issue_oauth_state(db)
     return GoogleAuthStart(authorization_url=build_authorization_url(state))
 
 
-@v1.get("/google/callback")
+@v1.get(
+    "/google/callback",
+    dependencies=[Depends(rate_limit("login", "RATE_LIMIT_LOGIN_PER_MINUTE"))],
+)
 async def google_callback(code: str, request: Request, db: DbDep, state: str | None = None):
     _require_google()
-    from mxtng_auth.google import exchange_code
+    from mxtng_auth.google import UnverifiedGoogleEmail, exchange_code
 
-    google_sub, email = await exchange_code(code)
+    # Burn the nonce before spending an authorization code (SECURITY_AUDIT H-3).
+    # Without this the callback accepted any code from anyone, which is login
+    # CSRF in one direction and authorization-code injection in the other.
+    await services.consume_oauth_state(db, state=state, ip=_client_ip(request))
+
+    try:
+        google_sub, email = await exchange_code(code)
+    except UnverifiedGoogleEmail as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     credential = await services.upsert_google_credential(
         db, google_sub=google_sub, email=email, ip=_client_ip(request)
     )
@@ -306,7 +339,19 @@ async def google_callback(code: str, request: Request, db: DbDep, state: str | N
 
 # --- Admin (service-to-service identity mutations) --------------------------
 async def _require_admin(x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None) -> None:
-    if not x_admin_key or not secrets.compare_digest(x_admin_key, settings.ADMIN_API_KEY):
+    """Gate the service-to-service identity mutations.
+
+    An unset key closes the surface rather than opening it: these endpoints
+    reassign a credential's email address, so "no key configured" must never
+    mean "no key required" (SECURITY_AUDIT H-1).
+    """
+    expected = reveal(settings.ADMIN_API_KEY)
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin API is not configured.",
+        )
+    if not x_admin_key or not secrets.compare_digest(x_admin_key, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 

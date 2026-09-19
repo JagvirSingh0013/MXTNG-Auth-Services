@@ -1,10 +1,15 @@
 """End-to-end auth flow tests, plus a product-verifier compatibility check.
 
-The headline test mints a token through /v1/login and verifies it exactly the way
-the ATS backend does (jose RS256 against the published JWKS, checking iss/aud) —
-proving the token contract is drop-in for the ATS.
+The headline test mints a token through the two-step sign-in and verifies it
+exactly the way the ATS backend does (jose RS256 against the published JWKS,
+checking iss/aud) — proving the token contract is drop-in for the ATS.
+
+Sign-in is challenge-only since SECURITY_AUDIT C-2 retired the single-step
+`/v1/login`, so every test that needs a token goes through `sign_in`.
 """
 from jose import jwt
+
+from tests.conftest import sign_in
 
 EMAIL = "rec@example.com"
 PASSWORD = "correct horse battery"
@@ -25,10 +30,9 @@ def _refresh_cookie(response):
 
 
 # --- Token contract / JWKS compatibility with the ATS verifier ---------------
-async def test_login_token_verifies_against_jwks_like_a_product(client):
+async def test_login_token_verifies_against_jwks_like_a_product(client, outbox):
     await _signup(client)
-    login = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
-    assert login.status_code == 200
+    login = await sign_in(client, outbox, email=EMAIL, password=PASSWORD)
     token = login.json()["access_token"]
 
     jwks = (await client.get("/.well-known/jwks.json")).json()
@@ -62,21 +66,54 @@ async def test_signup_is_idempotent_on_key_and_conflicts_on_email(client):
 
 
 # --- Login hardening --------------------------------------------------------
-async def test_repeated_bad_password_locks_account(client):
+async def test_repeated_bad_password_locks_account(client, outbox):
     await _signup(client)
     for _ in range(3):  # MAX_FAILED_LOGINS=3 in the test env
-        bad = await client.post("/v1/login", json={"email": EMAIL, "password": "wrong"})
+        bad = await client.post(
+            "/v1/login/challenge", json={"email": EMAIL, "password": "wrong"}
+        )
         assert bad.status_code == 401
 
-    locked = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
+    locked = await client.post(
+        "/v1/login/challenge", json={"email": EMAIL, "password": PASSWORD}
+    )
     assert locked.status_code == 429
     assert locked.json()["code"] == "account_locked"
 
 
-# --- Refresh rotation + reuse-as-theft --------------------------------------
-async def test_refresh_rotates_and_reuse_revokes_family(client):
+async def test_unknown_email_is_indistinguishable_from_a_wrong_password(client, outbox):
+    """SECURITY_AUDIT M-8: the two failures must look the same to a caller.
+
+    Timing is the real signal and cannot be asserted reliably here, but the
+    status, code and message are part of the same oracle and can be.
+    """
     await _signup(client)
-    login = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
+    unknown = await client.post(
+        "/v1/login/challenge", json={"email": "nobody@example.com", "password": PASSWORD}
+    )
+    wrong = await client.post(
+        "/v1/login/challenge", json={"email": EMAIL, "password": "not the password"}
+    )
+
+    assert unknown.status_code == wrong.status_code == 401
+    assert unknown.json() == wrong.json()
+
+
+async def test_idempotency_key_does_not_leak_another_account(client):
+    """SECURITY_AUDIT M-9: a reused key must not return someone else's identity."""
+    first = await _signup(client, email="one@example.com", key="shared-key")
+    assert first.status_code == 201
+
+    crossed = await _signup(client, email="two@example.com", key="shared-key")
+    assert crossed.status_code == 409
+    assert crossed.json()["code"] == "idempotency_key_conflict"
+    assert "one@example.com" not in crossed.text
+
+
+# --- Refresh rotation + reuse-as-theft --------------------------------------
+async def test_refresh_rotates_and_reuse_revokes_family(client, outbox):
+    await _signup(client)
+    login = await sign_in(client, outbox, email=EMAIL, password=PASSWORD)
     old_refresh = _refresh_cookie(login)
     assert old_refresh
 
@@ -100,11 +137,16 @@ async def test_refresh_rotates_and_reuse_revokes_family(client):
 
 
 # --- Password reset ---------------------------------------------------------
-async def test_password_reset_flow(client):
+async def test_password_reset_flow(client, outbox, monkeypatch):
+    from mxtng_auth.settings import settings
+
+    # The echo is opt-in now (SECURITY_AUDIT M-10), so a test that wants the raw
+    # token has to ask for it explicitly.
+    monkeypatch.setattr(settings, "DEBUG_ECHO_RESET_TOKENS", True)
+
     await _signup(client)
     req = await client.post("/v1/password-reset/request", json={"email": EMAIL})
     assert req.status_code == 200
-    # Dev surfaces the token as "reset_token=<raw>".
     reset_token = req.json()["message"].split("reset_token=", 1)[1]
 
     confirm = await client.post(
@@ -113,12 +155,25 @@ async def test_password_reset_flow(client):
     )
     assert confirm.status_code == 200
 
-    old = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
-    assert old.status_code == 401
-    new = await client.post(
-        "/v1/login", json={"email": EMAIL, "password": "a brand new secret"}
+    old = await client.post(
+        "/v1/login/challenge", json={"email": EMAIL, "password": PASSWORD}
     )
-    assert new.status_code == 200
+    assert old.status_code == 401
+    await sign_in(client, outbox, email=EMAIL, password="a brand new secret")
+
+
+async def test_reset_token_is_not_echoed_unless_explicitly_enabled(client, outbox):
+    """SECURITY_AUDIT M-10: the default must never hand a live token to a stranger."""
+    await _signup(client)
+    req = await client.post("/v1/password-reset/request", json={"email": EMAIL})
+
+    assert req.status_code == 200
+    assert "reset_token=" not in req.json()["message"]
+    # ...and the generic answer is the same for an address that does not exist.
+    unknown = await client.post(
+        "/v1/password-reset/request", json={"email": "nobody@example.com"}
+    )
+    assert unknown.json() == req.json()
 
 
 # --- Health -----------------------------------------------------------------

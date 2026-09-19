@@ -7,13 +7,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from mxtng_auth import events, mail
 from mxtng_auth.models import (
     AuthAuditLog,
     Credential,
+    OAuthState,
     PasswordResetToken,
     RefreshToken,
     Session,
@@ -30,6 +31,11 @@ from mxtng_auth.security import (
 )
 from mxtng_auth.settings import settings
 from mxtng_auth.tokens import mint_access_token, resolve_audience
+
+#: Hashed once at import so an unknown address costs the same bcrypt work a known
+#: one does (SECURITY_AUDIT M-8). Derived rather than hard-coded so it always
+#: carries the same cost factor `gensalt()` currently produces.
+_DUMMY_PASSWORD_HASH = hash_password("mxtng-auth-timing-equaliser")
 
 
 # --- Error taxonomy ---------------------------------------------------------
@@ -48,6 +54,11 @@ class AuthError(Exception):
 class EmailAlreadyRegistered(AuthError):
     status_code = 409
     code = "email_taken"
+
+
+class IdempotencyKeyConflict(AuthError):
+    status_code = 409
+    code = "idempotency_key_conflict"
 
 
 class InvalidCredentials(AuthError):
@@ -90,9 +101,9 @@ class MailDeliveryFailed(AuthError):
     code = "mail_delivery_failed"
 
 
-class OtpRequired(AuthError):
-    status_code = 403
-    code = "otp_required"
+class InvalidOAuthState(AuthError):
+    status_code = 400
+    code = "invalid_oauth_state"
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -158,12 +169,28 @@ async def create_credential(
     email = _normalize_email(email)
 
     if idempotency_key:
+        # Scoped to the email as well as the key (SECURITY_AUDIT M-9). A global
+        # lookup meant a guessed or reused key handed the caller back somebody
+        # else's `auth_user_id` and address.
         result = await db.execute(
-            select(Credential).where(Credential.idempotency_key == idempotency_key)
+            select(Credential).where(
+                Credential.idempotency_key == idempotency_key,
+                Credential.email == email,
+            )
         )
         existing = result.scalar_one_or_none()
         if existing is not None:
             return existing  # replayed request -> same UUID
+
+        # The key is in use for a *different* address: a genuine collision, not a
+        # replay. Saying so beats silently minting a second row under one key.
+        clash = await db.execute(
+            select(Credential.id).where(Credential.idempotency_key == idempotency_key)
+        )
+        if clash.first() is not None:
+            raise IdempotencyKeyConflict(
+                "That Idempotency-Key has already been used for a different email"
+            )
 
     if await _get_by_email(db, email) is not None:
         raise EmailAlreadyRegistered("That email is already registered")
@@ -188,6 +215,11 @@ async def authenticate(
     credential = await _get_by_email(db, email)
 
     if credential is None:
+        # Spend the same bcrypt work a real account would, then fail identically
+        # (SECURITY_AUDIT M-8). Returning early made a registered address
+        # measurably slower than an unregistered one, which is a free
+        # enumeration oracle over the whole user base.
+        verify_password(password, _DUMMY_PASSWORD_HASH)
         await _audit(db, "login_failed", email=email, ip=ip, detail="no_such_credential")
         await db.commit()
         raise InvalidCredentials("Invalid email or password")
@@ -198,12 +230,19 @@ async def authenticate(
         await db.commit()
         raise AccountLocked("Too many failed attempts. Try again later.")
 
+    # Whether an account is disabled is only the caller's business once they have
+    # proved they own it — otherwise the distinct 403 is another enumeration
+    # signal. Verify first, then decide which failure to report.
+    password_ok = verify_password(password, credential.password_hash)
+
     if credential.disabled:
         await _audit(db, "login_blocked_disabled", credential_id=credential.id, email=email, ip=ip)
         await db.commit()
-        raise AccountDisabled("This account has been disabled")
+        if password_ok:
+            raise AccountDisabled("This account has been disabled")
+        raise InvalidCredentials("Invalid email or password")
 
-    if not verify_password(password, credential.password_hash):
+    if not password_ok:
         credential.failed_attempts += 1
         if credential.failed_attempts >= settings.MAX_FAILED_LOGINS:
             credential.locked_until = _now() + timedelta(seconds=settings.LOGIN_LOCKOUT_SECONDS)
@@ -370,6 +409,10 @@ async def verify_challenge(
     challenge.consumed = True
     credential.failed_attempts = 0
     credential.locked_until = None
+    # Someone read a code we sent to this address, so it is reachable by whoever
+    # just signed in. That is the fact products need before turning an email
+    # domain into agency membership (SECURITY_AUDIT C-2).
+    credential.email_verified_at = _now()
     await _audit(db, "otp_verified", credential_id=credential.id, email=credential.email, ip=ip)
     await db.commit()
     return await issue_tokens(
@@ -393,6 +436,28 @@ async def is_session_live(db: AsyncSession, session_id: str) -> bool:
     `sid` we have never issued is not one of ours."""
     session = await get_session(db, session_id)
     return session is not None and not session.revoked
+
+
+async def live_session_ids(db: AsyncSession, session_ids: list[str]) -> list[str]:
+    """Which of `session_ids` are still live, in one query.
+
+    The per-id loop this replaces turned a single anonymous request into up to a
+    hundred sequential round trips — cheap to send, expensive to serve, and
+    therefore an amplification lever against the connection pool
+    (SECURITY_AUDIT M-2).
+    """
+    if not session_ids:
+        return []
+    unique = list(dict.fromkeys(session_ids))
+    result = await db.execute(
+        select(Session.session_id).where(
+            Session.session_id.in_(unique),
+            Session.revoked.is_(False),
+        )
+    )
+    live = set(result.scalars().all())
+    # Preserve the caller's order so a client can zip the answer against its input.
+    return [session_id for session_id in unique if session_id in live]
 
 
 async def revoke_sessions_for_credential(
@@ -525,15 +590,34 @@ async def issue_tokens(
 async def rotate_refresh(db: AsyncSession, *, raw: str, ip: str | None = None) -> tuple[str, int, str]:
     """Consume a refresh token and issue its successor. Replay of a rotated/revoked
     token is treated as theft and revokes the whole family (ADR-0006)."""
+    token_hash = hash_opaque_token(raw)
+
+    # Claim the token atomically before doing anything else (SECURITY_AUDIT
+    # M-20). Read-then-write let two concurrent presentations of the same token
+    # both pass the reuse check and both succeed, which is precisely the case
+    # rotation exists to catch. Exactly one caller can flip `rotated` here; every
+    # other one falls through to the reuse path below.
+    claimed = await db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.token_hash == token_hash,
+            RefreshToken.rotated.is_(False),
+            RefreshToken.revoked.is_(False),
+        )
+        .values(rotated=True)
+    )
+    won_the_race = claimed.rowcount == 1
+
     result = await db.execute(
-        select(RefreshToken).where(RefreshToken.token_hash == hash_opaque_token(raw))
+        select(RefreshToken).where(RefreshToken.token_hash == token_hash)
     )
     token = result.scalar_one_or_none()
 
     if token is None:
+        await db.rollback()
         raise InvalidRefresh("Invalid refresh token")
 
-    if token.revoked or token.rotated:
+    if not won_the_race:
         # Reuse of an already-consumed/revoked token => compromise. Burn the family.
         await _revoke_family(db, family_id=token.family_id)
         await _audit(
@@ -556,8 +640,7 @@ async def rotate_refresh(db: AsyncSession, *, raw: str, ip: str | None = None) -
     if session is not None and session.revoked:
         raise InvalidRefresh("This session has ended")
 
-    token.rotated = True
-    await db.commit()
+    await db.commit()  # persist the claim taken by the UPDATE above
     access_token, expires_in, new_raw = await issue_tokens(
         db,
         credential=credential,
@@ -702,6 +785,54 @@ async def confirm_password_reset(
     await revoke_all_for_credential(db, credential=credential, reason="password_reset")
 
 
+# --- OAuth state (Sign-in-with-Google CSRF nonce) ---------------------------
+async def issue_oauth_state(db: AsyncSession) -> str:
+    """Mint and persist a single-use `state` for an authorization request."""
+    raw = new_opaque_token()
+    db.add(
+        OAuthState(
+            state_hash=hash_opaque_token(raw),
+            expires_at=_now() + timedelta(seconds=settings.OAUTH_STATE_TTL_SECONDS),
+        )
+    )
+    await db.commit()
+    return raw
+
+
+async def consume_oauth_state(db: AsyncSession, *, state: str | None, ip: str | None = None) -> None:
+    """Burn the `state` a callback presented, or refuse the callback.
+
+    Claimed with a conditional UPDATE so two callbacks racing on one state cannot
+    both succeed — the same reasoning as refresh rotation.
+    """
+    if not state:
+        await _audit(db, "oauth_state_missing", ip=ip)
+        await db.commit()
+        raise InvalidOAuthState("Missing OAuth state")
+
+    claimed = await db.execute(
+        update(OAuthState)
+        .where(
+            OAuthState.state_hash == hash_opaque_token(state),
+            OAuthState.consumed.is_(False),
+            OAuthState.expires_at > _now(),
+        )
+        .values(consumed=True)
+    )
+    if claimed.rowcount != 1:
+        await db.rollback()
+        await _audit(db, "oauth_state_rejected", ip=ip)
+        await db.commit()
+        raise InvalidOAuthState("Invalid or expired OAuth state")
+    await db.commit()
+
+
+async def purge_expired_oauth_states(db: AsyncSession) -> None:
+    """Housekeeping so the table does not grow without bound."""
+    await db.execute(delete(OAuthState).where(OAuthState.expires_at < _now()))
+    await db.commit()
+
+
 # --- Google Sign-in ---------------------------------------------------------
 async def upsert_google_credential(
     db: AsyncSession, *, google_sub: str, email: str, ip: str | None = None
@@ -712,16 +843,23 @@ async def upsert_google_credential(
     result = await db.execute(select(Credential).where(Credential.google_sub == google_sub))
     credential = result.scalar_one_or_none()
     if credential is not None:
+        credential.email_verified_at = _now()
+        await db.commit()
         return credential
 
     credential = await _get_by_email(db, email)
     if credential is not None:
-        credential.google_sub = google_sub  # link Google to an existing password credential
+        # Google has confirmed this address (google.exchange_code refuses an
+        # unverified one, SECURITY_AUDIT H-2) and the Sign-in Code still has to
+        # land in the same mailbox before any token is issued, so linking here
+        # rests on two independent proofs rather than on a self-asserted claim.
+        credential.google_sub = google_sub
+        credential.email_verified_at = _now()
         await _audit(db, "google_linked", credential_id=credential.id, email=email, ip=ip)
         await db.commit()
         return credential
 
-    credential = Credential(email=email, google_sub=google_sub)
+    credential = Credential(email=email, google_sub=google_sub, email_verified_at=_now())
     db.add(credential)
     await _audit(db, "google_signup", email=email, ip=ip)
     await db.commit()

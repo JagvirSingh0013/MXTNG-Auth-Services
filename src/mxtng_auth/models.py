@@ -48,6 +48,16 @@ class Credential(Base):
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # When this address was last *proved* to be reachable by whoever signed in —
+    # set by a completed Sign-in Code, or by a Google identity Google itself
+    # marks verified. Products turn an email domain into tenancy (SECURITY_AUDIT
+    # C-2), so "we emailed this address and someone read it" is the fact they
+    # actually need, and it belongs in the identity record rather than being
+    # inferred from the existence of a row.
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now, nullable=False
@@ -123,6 +133,28 @@ class SignInChallenge(Base):
     last_sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
+
+
+class OAuthState(Base):
+    """A single-use CSRF nonce for the Sign-in-with-Google handshake (ADR-0005).
+
+    `/v1/google/start` used to mint a random `state` and the callback never read
+    it, which left the flow open to login CSRF and authorization-code injection
+    (SECURITY_AUDIT H-3). Persisting the nonce is what turns `state` from
+    decoration into a check: the callback must present one this service issued,
+    that has not expired, and that no earlier callback already consumed.
+
+    Only the SHA-256 of the value is stored — a leaked table is then a list of
+    digests rather than a set of usable states.
+    """
+
+    __tablename__ = "oauth_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     consumed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 

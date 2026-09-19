@@ -15,9 +15,13 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
 
-from mxtng_auth.settings import settings
+from mxtng_auth.settings import reveal, settings
 
 ALGORITHM = "RS256"
+
+
+class MissingSigningKey(RuntimeError):
+    """No signing key is configured and this environment may not invent one."""
 
 
 def _b64url_uint(value: int) -> str:
@@ -52,22 +56,35 @@ class LocalRSASigner(Signer):
     # --- construction -------------------------------------------------------
     @classmethod
     def from_settings(cls) -> "LocalRSASigner":
-        """Load the PEM from env, else from a file path, generating one in dev."""
-        pem: str | None = settings.PRIVATE_KEY_PEM
+        """Load the PEM from env, else from a file path, generating one in dev.
+
+        Outside development a missing key is fatal (SECURITY_AUDIT M-5).
+        Generating one in memory produced a service that booted happily and then
+        signed every replica's tokens with a different, unrecoverable key — every
+        restart silently invalidated every outstanding session, and no log line
+        said why.
+        """
+        pem: str | None = reveal(settings.PRIVATE_KEY_PEM)
         if not pem:
             path = Path(settings.PRIVATE_KEY_PATH)
             if path.exists():
                 pem = path.read_text()
-            else:
+            elif settings.is_development:
                 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
                 pem = key.private_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PrivateFormat.PKCS8,
                     encryption_algorithm=serialization.NoEncryption(),
                 ).decode("ascii")
-                # Dev convenience only; prod injects PRIVATE_KEY_PEM from a secret manager.
-                if settings.ENVIRONMENT != "production":
-                    path.write_text(pem)
+                path.write_text(pem)
+            else:
+                raise MissingSigningKey(
+                    "No RS256 signing key available: set PRIVATE_KEY_PEM (from a "
+                    f"secret manager) or mount one at PRIVATE_KEY_PATH "
+                    f"({settings.PRIVATE_KEY_PATH}). Refusing to generate an "
+                    "ephemeral key outside development — it would be different on "
+                    "every replica and lost on every restart."
+                )
 
         private_key = serialization.load_pem_private_key(pem.encode("ascii"), password=None)
         if not isinstance(private_key, rsa.RSAPrivateKey):

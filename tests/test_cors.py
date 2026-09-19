@@ -4,7 +4,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_login_preflight_allows_production_ats_origin(client):
     response = await client.options(
-        "/v1/login",
+        "/v1/login/challenge",
         headers={
             "Origin": "https://ats-iota-five.vercel.app",
             "Access-Control-Request-Method": "POST",

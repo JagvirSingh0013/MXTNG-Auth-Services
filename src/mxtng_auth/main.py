@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from mxtng_auth.api import admin, public_router, v1
 from mxtng_auth.db import init_models
 from mxtng_auth.services import AuthError
-from mxtng_auth.settings import settings
+from mxtng_auth.settings import reveal, settings
 from mxtng_auth.signer import get_signer
 
 logger = logging.getLogger(__name__)
@@ -37,15 +38,14 @@ def check_mail_configuration() -> None:
     has_fallback = settings.fallback_smtp_enabled
 
     if not has_relay and not has_fallback:
-        message = (
+        # The Sign-in Code is now the only way in (SECURITY_AUDIT C-2), so a
+        # service with no mail path cannot authenticate anyone. Every sign-in
+        # would 502; starting up is worse than not starting.
+        raise MailNotConfigured(
             "No mail path configured: set MAIL_RELAY_URL (the ATS platform-mail relay) "
-            "or FALLBACK_SMTP_HOST. Without one, no Sign-in Code can be delivered."
+            "or FALLBACK_SMTP_HOST. Without one, no Sign-in Code can be delivered and "
+            "no one can sign in."
         )
-        if settings.REQUIRE_OTP:
-            # Every sign-in would 502. Starting up is worse than not starting.
-            raise MailNotConfigured(message)
-        logger.error("%s Legacy /v1/login still works while REQUIRE_OTP is false.", message)
-        return
 
     if not has_fallback:
         logger.warning(
@@ -54,10 +54,10 @@ def check_mail_configuration() -> None:
             "recovered without one (ADR-0011)."
         )
 
-    if has_relay and settings.MAIL_RELAY_SECRET == "change-me-mail-relay-secret":
+    if has_relay and not reveal(settings.MAIL_RELAY_SECRET):
         logger.error(
-            "MAIL_RELAY_SECRET is still the published default. The ATS relay will "
-            "reject these requests, or worse, accept anyone else's."
+            "MAIL_RELAY_URL is set but MAIL_RELAY_SECRET is not. The ATS relay will "
+            "reject every request, so no Sign-in Code will be delivered through it."
         )
 
 
@@ -67,16 +67,17 @@ async def lifespan(app: FastAPI):
     signer = get_signer()
     logger.info("Signing key ready (kid=%s)", getattr(signer, "kid", "?"))
     check_mail_configuration()
-    # Dev/test convenience; production provisions schema via migrations.
-    if settings.ENVIRONMENT != "production":
+    # Dev/test convenience; staging and production provision schema via migrations.
+    if settings.is_development:
         await init_models()
     yield
 
 
 def create_app() -> FastAPI:
-    # Disable interactive API docs and the OpenAPI schema in production — they
-    # enumerate every route/schema and must not be publicly reachable there.
-    docs_enabled = settings.ENVIRONMENT.lower() != "production"
+    # Disable interactive API docs and the OpenAPI schema outside development —
+    # they enumerate every route/schema and must not be publicly reachable. A
+    # staging deployment is as reachable as production, so it is covered too.
+    docs_enabled = settings.is_development
     app = FastAPI(
         title="MXTNG Auth Service",
         version="0.1.0",
@@ -94,6 +95,27 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Reject Host headers this deployment does not answer for (SECURITY_AUDIT
+    # L-5). Absolute URLs built from a forged Host end up in reset emails.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.TRUSTED_HOSTS)
+
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next):
+        """Baseline response headers. This service answers JSON only, so the
+        XSS-adjacent headers are cheap insurance rather than load-bearing; HSTS
+        is the one that matters, since every token here rides over TLS."""
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Cache-Control", "no-store")
+        if settings.is_production:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                f"max-age={settings.HSTS_MAX_AGE_SECONDS}; includeSubDomains; preload",
+            )
+        return response
 
     @app.exception_handler(AuthError)
     async def _auth_error_handler(_request: Request, exc: AuthError) -> JSONResponse:

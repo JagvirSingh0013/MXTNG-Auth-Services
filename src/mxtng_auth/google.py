@@ -13,7 +13,12 @@ import urllib.parse
 
 import httpx
 
-from mxtng_auth.settings import settings
+from mxtng_auth.settings import reveal, settings
+
+
+class UnverifiedGoogleEmail(ValueError):
+    """The ID token carried an address Google has not confirmed."""
+
 
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
@@ -38,6 +43,11 @@ async def exchange_code(code: str) -> tuple[str, str]:
 
     The Google ID token's signature/issuer/audience are verified with
     `google-auth`; we never trust an unverified token.
+
+    `email_verified` is checked as well (SECURITY_AUDIT H-2). Without it, an
+    identity whose profile address merely *claims* to be a victim's is enough to
+    be linked onto that victim's existing password credential — a signature-valid
+    token proves Google issued it, not that Google confirmed the mailbox.
     """
     try:
         from google.auth.transport import requests as google_requests
@@ -53,7 +63,7 @@ async def exchange_code(code: str) -> tuple[str, str]:
             data={
                 "code": code,
                 "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                "client_secret": reveal(settings.GOOGLE_CLIENT_SECRET),
                 "redirect_uri": settings.GOOGLE_REDIRECT_URI,
                 "grant_type": "authorization_code",
             },
@@ -70,4 +80,24 @@ async def exchange_code(code: str) -> tuple[str, str]:
     sub = claims.get("sub")
     if not email or not sub:
         raise ValueError("Google identity missing email/sub")
+    _require_verified_email(claims)
     return sub, email
+
+
+def _require_verified_email(claims: dict) -> None:
+    """Refuse an address Google has not itself confirmed.
+
+    A signature-valid ID token proves Google issued it, not that Google checked
+    the mailbox. Without this, an identity whose profile address merely *claims*
+    to be a victim's is enough to be linked onto that victim's existing password
+    credential (SECURITY_AUDIT H-2).
+
+    Google reports the claim as a bool on modern tokens and occasionally as the
+    string "true" on older ones; anything else is "not confirmed".
+    """
+    verified = claims.get("email_verified")
+    if verified is not True and str(verified).lower() != "true":
+        raise UnverifiedGoogleEmail(
+            "Google has not verified this account's email address, so it cannot "
+            "be used to sign in or to claim an existing account."
+        )

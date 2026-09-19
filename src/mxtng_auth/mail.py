@@ -19,13 +19,14 @@ import html
 import json
 import logging
 import smtplib
+import ssl
 import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 
 import httpx
 
-from mxtng_auth.settings import settings
+from mxtng_auth.settings import reveal, settings
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +120,19 @@ def render_password_reset(*, token: str, ttl_seconds: int, reset_url: str | None
 
 # --- Relay ------------------------------------------------------------------
 def _sign(body: bytes, timestamp: str) -> str:
+    secret = reveal(settings.MAIL_RELAY_SECRET)
+    if not secret:
+        raise MailUndeliverable("MAIL_RELAY_SECRET is not configured")
     payload = timestamp.encode("utf-8") + b"." + body
-    digest = hmac.new(settings.MAIL_RELAY_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
 
 
 async def _send_via_relay(*, to_email: str, message: RenderedMessage, purpose: str, mode: str) -> None:
     if not settings.MAIL_RELAY_URL:
         raise MailUndeliverable("No mail relay configured")
+    if not reveal(settings.MAIL_RELAY_SECRET):
+        raise MailUndeliverable("MAIL_RELAY_SECRET is not configured")
 
     body = json.dumps(
         {
@@ -166,9 +172,14 @@ def _send_smtp_blocking(*, to_email: str, message: RenderedMessage) -> None:
         timeout=settings.FALLBACK_SMTP_TIMEOUT_SECONDS,
     ) as smtp:
         if settings.FALLBACK_SMTP_USE_TLS:
-            smtp.starttls()
+            # Pass an explicit verifying context rather than relying on the
+            # stdlib default, which has differed between Python versions.
+            smtp.starttls(context=ssl.create_default_context())
         if settings.FALLBACK_SMTP_USERNAME:
-            smtp.login(settings.FALLBACK_SMTP_USERNAME, settings.FALLBACK_SMTP_PASSWORD or "")
+            smtp.login(
+                settings.FALLBACK_SMTP_USERNAME,
+                reveal(settings.FALLBACK_SMTP_PASSWORD) or "",
+            )
         smtp.send_message(email)
 
 

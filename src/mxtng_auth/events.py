@@ -11,12 +11,13 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
 import httpx
 
-from mxtng_auth.settings import settings
+from mxtng_auth.settings import reveal, settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +25,34 @@ EMAIL_CHANGED = "email.changed"
 ACCOUNT_DISABLED = "account.disabled"
 
 
-def _sign(body: bytes) -> str:
-    digest = hmac.new(settings.WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+def _sign(body: bytes, timestamp: str) -> str:
+    """HMAC over `timestamp . body`, matching the mail relay's scheme.
+
+    Signing the body alone made every delivered event an indefinitely replayable
+    artefact: one captured `account.disabled` could be re-posted forever
+    (SECURITY_AUDIT M-14). Binding the timestamp into the signature lets a
+    receiver reject anything outside a narrow window.
+    """
+    secret = reveal(settings.WEBHOOK_SECRET)
+    if not secret:
+        raise RuntimeError("WEBHOOK_SECRET is not configured")
+    payload = timestamp.encode("utf-8") + b"." + body
+    digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
 
 
 async def emit(event_type: str, *, auth_user_id: str, data: dict) -> None:
     """Fan out one IdentityEvent to every registered endpoint. Never raises."""
     if not settings.WEBHOOK_ENDPOINTS:
+        return
+    if not reveal(settings.WEBHOOK_SECRET):
+        # Unsigned identity events are worse than undelivered ones: a receiver
+        # that accepts them accepts anyone's.
+        logger.error(
+            "Refusing to emit IdentityEvent %s: WEBHOOK_ENDPOINTS is configured but "
+            "WEBHOOK_SECRET is not.",
+            event_type,
+        )
         return
     event = {
         "id": str(uuid.uuid4()),
@@ -41,9 +62,11 @@ async def emit(event_type: str, *, auth_user_id: str, data: dict) -> None:
         "data": data,
     }
     body = json.dumps(event, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
     headers = {
         "Content-Type": "application/json",
-        "X-MXTNG-Signature": _sign(body),
+        "X-MXTNG-Timestamp": timestamp,
+        "X-MXTNG-Signature": _sign(body, timestamp),
         "X-MXTNG-Event": event_type,
         "X-MXTNG-Event-Id": event["id"],
     }

@@ -8,6 +8,7 @@ so it needs exercising, not just existing.
 import pytest
 
 from jose import jwt
+from pydantic import SecretStr
 
 from mxtng_auth import mail, services
 from mxtng_auth.settings import settings
@@ -16,20 +17,8 @@ EMAIL = "rec@example.com"
 PASSWORD = "correct horse battery"
 
 
-@pytest.fixture
-def outbox(monkeypatch):
-    """Capture what would be mailed, standing in for the relay."""
-    sent = []
-
-    async def _fake_send(*, to_email, message, purpose, mode):
-        sent.append(
-            {"to": to_email, "subject": message.subject, "text": message.text_body,
-             "purpose": purpose, "mode": mode}
-        )
-        return "relay"
-
-    monkeypatch.setattr(mail, "send", _fake_send)
-    return sent
+# `outbox` now lives in conftest: every sign-in goes through the emailed code,
+# so capturing mail is no longer this module's private concern.
 
 
 def _code_from(entry):
@@ -173,21 +162,19 @@ async def test_unknown_challenge_is_rejected(client, outbox):
     assert response.status_code == 401
 
 
-# --- Rollout switch ---------------------------------------------------------
-async def test_legacy_login_still_issues_tokens_until_the_switch_flips(client, outbox):
-    await _signup(client)
-    legacy = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
-    assert legacy.status_code == 200
-    assert "access_token" in legacy.json()
-    assert outbox == []  # no challenge, no mail
+# --- The single-step path is gone -------------------------------------------
+async def test_legacy_single_step_login_no_longer_exists(client, outbox):
+    """SECURITY_AUDIT C-2.
 
-
-async def test_flipping_require_otp_retires_legacy_login(client, outbox, monkeypatch):
-    monkeypatch.setattr(settings, "REQUIRE_OTP", True)
+    `/v1/login` issued tokens on a password alone, so nothing proved the person
+    controlled the mailbox — and the ATS turns a verified email domain into
+    agency membership. It was removed outright rather than left behind a flag
+    that could switch the hole back on.
+    """
     await _signup(client)
-    legacy = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
-    assert legacy.status_code == 403
-    assert legacy.json()["code"] == "otp_required"
+    gone = await client.post("/v1/login", json={"email": EMAIL, "password": PASSWORD})
+    assert gone.status_code == 405 or gone.status_code == 404
+    assert outbox == []
 
 
 # --- Mail delivery ----------------------------------------------------------
@@ -257,29 +244,17 @@ async def test_a_delivery_failure_reports_both_causes(monkeypatch):
 
 
 # --- Startup configuration check --------------------------------------------
-def test_startup_refuses_when_otp_is_required_but_nothing_can_send(monkeypatch):
+def test_startup_refuses_when_nothing_can_send(monkeypatch):
     """Starting up is worse than not starting: every sign-in would 502, far from
-    the cause."""
+    the cause. The Sign-in Code is the only way in now, so no mail path means no
+    authentication at all."""
     from mxtng_auth.main import MailNotConfigured, check_mail_configuration
 
-    monkeypatch.setattr(settings, "REQUIRE_OTP", True)
     monkeypatch.setattr(settings, "MAIL_RELAY_URL", None)
     monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
 
     with pytest.raises(MailNotConfigured, match="No mail path configured"):
         check_mail_configuration()
-
-
-def test_startup_only_complains_while_legacy_login_still_works(monkeypatch, caplog):
-    from mxtng_auth.main import check_mail_configuration
-
-    monkeypatch.setattr(settings, "REQUIRE_OTP", False)
-    monkeypatch.setattr(settings, "MAIL_RELAY_URL", None)
-    monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
-
-    with caplog.at_level("ERROR"):
-        check_mail_configuration()  # must not raise
-    assert "No mail path configured" in caplog.text
 
 
 def test_startup_warns_when_only_the_relay_is_configured(monkeypatch, caplog):
@@ -288,7 +263,7 @@ def test_startup_warns_when_only_the_relay_is_configured(monkeypatch, caplog):
     from mxtng_auth.main import check_mail_configuration
 
     monkeypatch.setattr(settings, "MAIL_RELAY_URL", "http://ats.test/api/v1/internal/mail")
-    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", "a-real-secret")
+    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", SecretStr("a-real-secret"))
     monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", None)
 
     with caplog.at_level("WARNING"):
@@ -296,11 +271,13 @@ def test_startup_warns_when_only_the_relay_is_configured(monkeypatch, caplog):
     assert "FALLBACK_SMTP_HOST" in caplog.text
 
 
-def test_startup_flags_a_default_relay_secret(monkeypatch, caplog):
+def test_startup_flags_a_missing_relay_secret(monkeypatch, caplog):
+    """SECURITY_AUDIT H-1: there is no default to fall back to any more, so the
+    misconfiguration to catch is an unset secret rather than a published one."""
     from mxtng_auth.main import check_mail_configuration
 
     monkeypatch.setattr(settings, "MAIL_RELAY_URL", "http://ats.test/api/v1/internal/mail")
-    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", "change-me-mail-relay-secret")
+    monkeypatch.setattr(settings, "MAIL_RELAY_SECRET", None)
     monkeypatch.setattr(settings, "FALLBACK_SMTP_HOST", "smtp.example.test")
 
     with caplog.at_level("ERROR"):
